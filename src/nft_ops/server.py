@@ -1,0 +1,531 @@
+"""Local HTTP API and dashboard. Binds to 127.0.0.1 only.
+
+Protection against other websites in the same browser:
+  * every /api call except state/create/unlock needs the X-Session token returned by unlock;
+    a custom header cannot be sent cross-site without a CORS preflight, which is never granted;
+  * the Host header must be 127.0.0.1/localhost on our port (blocks DNS-rebinding);
+  * requests carrying a foreign Origin are rejected.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import csv
+import io
+import json
+import secrets
+import time
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+
+from osnm_z.opensea_protocol import ProtocolError
+
+from . import __version__, balances, collections, eligibility
+from .balances import format_units
+from .collections import CollectionError, OpenSeaFactory, default_opensea_factory
+from .db import Database
+from .events import EventBus
+from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
+from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
+from .safety import LIMIT_LABELS, Safety, from_wei
+from .vault import Vault, VaultError
+from .wallets import WalletError, WalletService, checksum, safe_cell
+
+STATIC = Path(__file__).parent / "static"
+USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, RpcError, ValueError,
+               ProtocolError, KeyError)
+OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
+
+
+class AppState:
+    def __init__(self, data_dir: Path, opensea_factory: OpenSeaFactory | None = None,
+                 pool: RpcPool | None = None, gateway_factory=None) -> None:
+        self.db = Database(data_dir / "nft-ops.db")
+        seed_networks(self.db)
+        self.vault = Vault(data_dir / "vault.json")
+        self.bus = EventBus()
+        self.safety = Safety(self.db, self.bus)
+        self.pool = pool or RpcPool(self.db)
+        self.wallets = WalletService(self.db, self.vault)
+        self.opensea_factory = opensea_factory or default_opensea_factory()
+        self.mint = MintEngine(self.db, self.vault, self.pool, self.bus, self.safety,
+                               self.opensea_factory, gateway_factory)
+        self.sessions: set[str] = set()
+        self.scan_task: asyncio.Task | None = None
+        self.scan_progress: dict[str, Any] = {}
+
+
+def create_app(state: AppState, port: int) -> FastAPI:
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI):
+        async def health_loop() -> None:
+            while True:
+                for net in state.db.all("SELECT chain_id FROM networks WHERE enabled = 1"):
+                    try:
+                        await state.pool.check(net["chain_id"])
+                    except Exception:  # noqa: BLE001 - health loop must never die
+                        pass
+                await asyncio.sleep(60)
+        task = asyncio.create_task(health_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+
+    app = FastAPI(title="nft-ops", docs_url=None, redoc_url=None, openapi_url=None,
+                  lifespan=lifespan)
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    allowed_origins = {f"http://{h}" for h in allowed_hosts}
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        if request.headers.get("host", "") not in allowed_hosts:
+            return PlainTextResponse("forbidden host", status_code=403)
+        origin = request.headers.get("origin")
+        if origin and origin not in allowed_origins:
+            return PlainTextResponse("forbidden origin", status_code=403)
+        path = request.url.path
+        if path.startswith("/api/") and path not in OPEN_PATHS:
+            token = request.headers.get("x-session", "")
+            if not token or token not in state.sessions:
+                return JSONResponse({"error": "locked", "locked": True}, status_code=401)
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; frame-ancestors 'none'")
+        return response
+
+    async def user_error(_: Request, error: Exception) -> JSONResponse:
+        return JSONResponse({"error": str(error) or type(error).__name__}, status_code=400)
+
+    for error_type in USER_ERRORS:
+        app.add_exception_handler(error_type, user_error)
+
+    async def body(request: Request) -> dict:
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            raise ValueError("invalid JSON body") from None
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        return data
+
+    def ok(**data: Any) -> dict:
+        return {"ok": True, **data}
+
+    # ----- pages -----------------------------------------------------------------------
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(STATIC / "index.html")
+
+    @app.get("/static/{name}")
+    async def static(name: str) -> FileResponse:
+        if name not in {"app.js", "style.css", "icon.svg"}:
+            raise KeyError("not found")
+        return FileResponse(STATIC / name)
+
+    # ----- vault & session -------------------------------------------------------------
+    @app.get("/api/state")
+    async def api_state() -> dict:
+        return {"vault_exists": state.vault.exists(), "unlocked": state.vault.unlocked,
+                "stopped": state.safety.stopped, "version": __version__}
+
+    def new_session() -> str:
+        token = secrets.token_urlsafe(32)
+        state.sessions.add(token)
+        return token
+
+    @app.post("/api/vault/create")
+    async def vault_create(request: Request) -> dict:
+        data = await body(request)
+        state.vault.create(str(data.get("password", "")))
+        return ok(session=new_session())
+
+    @app.post("/api/vault/unlock")
+    async def vault_unlock(request: Request) -> dict:
+        data = await body(request)
+        await asyncio.sleep(0.3)  # slow down password guessing
+        await asyncio.to_thread(state.vault.unlock, str(data.get("password", "")))
+        return ok(session=new_session())
+
+    @app.post("/api/vault/lock")
+    async def vault_lock() -> dict:
+        if state.mint.active_wallets:
+            raise ValueError("an operation is running; stop it or wait before locking")
+        state.vault.lock()
+        state.sessions.clear()
+        return ok()
+
+    @app.post("/api/vault/password")
+    async def vault_password(request: Request) -> dict:
+        data = await body(request)
+        await asyncio.to_thread(state.vault.change_password, str(data.get("old", "")),
+                                str(data.get("new", "")))
+        return ok()
+
+    # ----- overview --------------------------------------------------------------------
+    @app.get("/api/overview")
+    async def overview() -> dict:
+        db = state.db
+        wallets = db.one("SELECT COUNT(*) AS n, SUM(has_key) AS k FROM wallets")
+        totals = []
+        for net in db.all("SELECT chain_id, name, native_symbol FROM networks WHERE enabled = 1"):
+            amount = sum(int(r["amount"]) for r in db.all(
+                "SELECT amount FROM balances WHERE chain_id = ? AND asset = 'native'",
+                (net["chain_id"],)))
+            nfts = sum(int(r["amount"]) for r in db.all(
+                "SELECT amount FROM balances WHERE chain_id = ? AND asset LIKE 'nft:%'",
+                (net["chain_id"],)))
+            totals.append({**net, "native": format_units(amount), "nfts": nfts})
+        since = time.time() - 86_400
+        counts = {r["status"]: r["n"] for r in db.all(
+            "SELECT status, COUNT(*) AS n FROM history WHERE created_at >= ? GROUP BY status",
+            (since,))}
+        upcoming = []
+        now = time.time()
+        for c in collections.list_all(db):
+            for s in c["stages"]:
+                if s["state"] != "ended":
+                    upcoming.append({"slug": c["slug"], "chain_name": c["chain_name"], **s})
+        upcoming.sort(key=lambda s: s["starts_at"])
+        eligible = db.one("SELECT COUNT(DISTINCT address) AS n FROM eligibility "
+                          "WHERE status = 'ELIGIBLE'")["n"]
+        return {
+            "wallets": wallets["n"] or 0, "with_keys": wallets["k"] or 0, "totals": totals,
+            "eligible_wallets": eligible, "last24h": counts, "upcoming": upcoming[:10],
+            "active_jobs": [j for j in state.mint.list_jobs() if j["status"] == "running"],
+            "recent": db.all("SELECT * FROM history ORDER BY id DESC LIMIT 10"),
+            "stopped": state.safety.stopped, "now": now,
+        }
+
+    # ----- wallets & groups ------------------------------------------------------------
+    @app.get("/api/wallets")
+    async def wallets_list(chain_id: int = 4663) -> dict:
+        table = balances.balance_table(state.db, chain_id)
+        tokens = state.db.all("SELECT * FROM tokens WHERE chain_id = ?", (chain_id,))
+        rows = state.wallets.list()
+        for w in rows:
+            b = table.get(w["address"], {})
+            w["native"] = format_units(b.get("native")) if "native" in b else None
+            w["tokens"] = {t["symbol"]: format_units(b[t["address"]], t["decimals"])
+                           for t in tokens if t["address"] in b}
+            w["nfts"] = sum(int(v) for k, v in b.items() if k.startswith("nft:"))
+        return {"wallets": rows, "groups": state.wallets.groups(), "tokens": tokens}
+
+    @app.post("/api/wallets/import-keys")
+    async def wallets_import(request: Request) -> dict:
+        data = await body(request)
+        return ok(**state.wallets.import_keys(str(data.get("text", "")), data.get("group") or None))
+
+    @app.post("/api/wallets/generate")
+    async def wallets_generate(request: Request) -> dict:
+        data = await body(request)
+        made = state.wallets.generate(int(data.get("count", 1)), str(data.get("prefix") or "gen"),
+                                      data.get("group") or None)
+        return ok(addresses=made)
+
+    @app.post("/api/wallets/watch")
+    async def wallets_watch(request: Request) -> dict:
+        data = await body(request)
+        return ok(address=state.wallets.add_watch_only(str(data.get("address", "")),
+                                                       str(data.get("label", ""))))
+
+    @app.post("/api/wallets/label")
+    async def wallets_label(request: Request) -> dict:
+        data = await body(request)
+        state.wallets.set_label(str(data["address"]), str(data.get("label", "")))
+        return ok()
+
+    @app.post("/api/wallets/remove")
+    async def wallets_remove(request: Request) -> dict:
+        data = await body(request)
+        if str(data.get("confirm", "")).strip().upper() != "REMOVE":
+            raise ValueError("type REMOVE to confirm; removed keys are deleted from the vault")
+        busy = [a for a in data.get("addresses", []) if checksum(a) in state.mint.active_wallets]
+        if busy:
+            raise ValueError(f"{busy[0]} is in a running operation")
+        return ok(removed=state.wallets.remove(list(data.get("addresses", []))))
+
+    @app.get("/api/wallets/export.csv")
+    async def wallets_csv() -> PlainTextResponse:
+        return _csv_response(state.wallets.export_csv(), "wallets.csv")
+
+    @app.post("/api/wallets/csv/validate")
+    async def wallets_csv_validate(request: Request) -> dict:
+        return state.wallets.validate_csv(str((await body(request)).get("text", "")))
+
+    @app.post("/api/wallets/csv/import")
+    async def wallets_csv_import(request: Request) -> dict:
+        return ok(**state.wallets.import_csv(str((await body(request)).get("text", ""))))
+
+    @app.post("/api/groups")
+    async def groups_action(request: Request) -> dict:
+        data = await body(request)
+        action = data.get("action")
+        if action == "create":
+            state.wallets.create_group(str(data["name"]))
+        elif action == "rename":
+            state.wallets.rename_group(str(data["name"]), str(data["new_name"]))
+        elif action == "delete":
+            state.wallets.delete_group(str(data["name"]))
+        elif action == "add":
+            state.wallets.add_to_group(list(data["addresses"]), str(data["name"]))
+        elif action == "remove":
+            state.wallets.remove_from_group(list(data["addresses"]), str(data["name"]))
+        else:
+            raise ValueError("unknown group action")
+        return ok(groups=state.wallets.groups())
+
+    def selection(data: dict) -> list[str]:
+        return state.wallets.resolve_selection(data.get("addresses") or None,
+                                               data.get("group") or None,
+                                               data.get("exclude") or None)
+
+    # ----- balances & tokens -----------------------------------------------------------
+    @app.post("/api/balances/scan")
+    async def balances_scan(request: Request) -> dict:
+        data = await body(request)
+        chain_id = int(data.get("chain_id", 4663))
+        nfts = [c["address"] for c in state.db.all(
+            "SELECT address FROM collections WHERE chain_id = ?", (chain_id,))]
+        return ok(**await balances.scan(state.db, state.pool, chain_id, selection(data), nfts))
+
+    @app.post("/api/tokens")
+    async def tokens_add(request: Request) -> dict:
+        data = await body(request)
+        return ok(token=await balances.add_token(state.db, state.pool, int(data["chain_id"]),
+                                                 checksum(str(data["address"]))))
+
+    # ----- networks --------------------------------------------------------------------
+    @app.get("/api/networks")
+    async def networks_list() -> dict:
+        nets = state.db.all("SELECT * FROM networks ORDER BY enabled DESC, chain_id = 4663 DESC, name")
+        for n in nets:
+            n["rpcs"] = state.db.all("SELECT * FROM rpc_endpoints WHERE chain_id = ? ORDER BY "
+                                     "priority, id", (n["chain_id"],))
+        return {"networks": nets}
+
+    @app.post("/api/networks")
+    async def networks_action(request: Request) -> dict:
+        data = await body(request)
+        action = data.get("action")
+        chain_id = int(data["chain_id"])
+        if action == "add":
+            name = " ".join(str(data.get("name", "")).split())[:40]
+            symbol = str(data.get("symbol", "ETH")).strip()[:8]
+            if not name or not symbol:
+                raise ValueError("name and native symbol are required")
+            state.db.execute("INSERT INTO networks(chain_id, name, native_symbol, explorer_url) "
+                             "VALUES(?, ?, ?, ?)", (chain_id, name, symbol,
+                                                     str(data.get("explorer", ""))[:200]))
+        elif action == "toggle":
+            state.db.execute("UPDATE networks SET enabled = 1 - enabled WHERE chain_id = ?",
+                             (chain_id,))
+        elif action == "add_rpc":
+            url = validate_rpc_url(str(data.get("url", "")))
+            state.db.execute("INSERT OR IGNORE INTO rpc_endpoints(chain_id, url, priority) "
+                             "VALUES(?, ?, ?)", (chain_id, url, int(data.get("priority", 50))))
+        elif action == "remove_rpc":
+            state.db.execute("DELETE FROM rpc_endpoints WHERE id = ? AND chain_id = ?",
+                             (int(data["rpc_id"]), chain_id))
+        elif action == "toggle_rpc":
+            state.db.execute("UPDATE rpc_endpoints SET enabled = 1 - enabled WHERE id = ?",
+                             (int(data["rpc_id"]),))
+        elif action != "check":
+            raise ValueError("unknown network action")
+        return ok(rpcs=await state.pool.check(chain_id))
+
+    # ----- collections & eligibility ---------------------------------------------------
+    @app.get("/api/collections")
+    async def collections_list() -> dict:
+        return {"collections": collections.list_all(state.db)}
+
+    @app.post("/api/collections")
+    async def collections_add(request: Request) -> dict:
+        data = await body(request)
+        chain_id = data.get("chain_id")
+        meta = await collections.load(state.db, state.opensea_factory, str(data["locator"]),
+                                      int(chain_id) if chain_id else None)
+        return ok(collection=collections.describe(meta))
+
+    @app.post("/api/collections/delete")
+    async def collections_delete(request: Request) -> dict:
+        slug = str((await body(request))["slug"])
+        state.db.execute("DELETE FROM collections WHERE slug = ?", (slug,))
+        state.db.execute("DELETE FROM eligibility WHERE slug = ?", (slug,))
+        return ok()
+
+    @app.post("/api/eligibility/scan")
+    async def eligibility_scan(request: Request) -> dict:
+        data = await body(request)
+        if state.scan_task and not state.scan_task.done():
+            raise ValueError("an eligibility scan is already running")
+        slug = str(data["slug"])
+        meta = await collections.load(state.db, state.opensea_factory, slug, None)
+        addresses = selection(data)
+        settings = state.db.get_setting("eligibility", {}) or {}
+        state.scan_progress = {"slug": slug, "total": len(addresses), "done": 0, "running": True}
+
+        def on_result(address: str, results: list) -> None:
+            state.scan_progress["done"] += 1
+            state.bus.publish("eligibility", slug=slug, address=address,
+                              done=state.scan_progress["done"], total=len(addresses),
+                              statuses=[r.status for r in results])
+
+        async def run() -> None:
+            try:
+                counts = await eligibility.scan(
+                    state.db, state.opensea_factory, state.vault, meta, addresses,
+                    concurrency=int(settings.get("concurrency", 3)),
+                    spacing_seconds=float(settings.get("spacing_seconds", 0.3)),
+                    on_result=on_result, should_stop=lambda: state.safety.stopped)
+                state.bus.publish("eligibility_done", slug=slug, counts=counts)
+            finally:
+                state.scan_progress["running"] = False
+        state.scan_task = asyncio.create_task(run())
+        return ok(total=len(addresses))
+
+    @app.get("/api/eligibility")
+    async def eligibility_list(slug: str) -> dict:
+        meta = collections.get(state.db, slug)
+        return {"rows": eligibility.table(state.db, slug, meta),
+                "collection": collections.describe(meta), "progress": state.scan_progress}
+
+    @app.get("/api/eligibility.csv")
+    async def eligibility_csv(slug: str) -> PlainTextResponse:
+        meta = collections.get(state.db, slug)
+        rows = eligibility.table(state.db, slug, meta)
+        cols = ["address", "label", "stage_name", "stage_type", "status", "detail", "max_quantity",
+                "minted", "price_wei", "source", "checked_at"]
+        return _csv_response(_to_csv(rows, cols), f"eligibility-{slug}.csv")
+
+    # ----- mint ------------------------------------------------------------------------
+    @app.post("/api/mint/preview")
+    async def mint_preview(request: Request) -> dict:
+        data = await body(request)
+        defaults = {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})}
+        params = MintParams(
+            slug=str(data["slug"]), stage_index=int(data["stage_index"]),
+            addresses=selection(data), quantity=int(data.get("quantity", 1)),
+            gas_limit=int(data.get("gas_limit") or defaults["gas_limit"]),
+            fee_mode=str(data.get("fee_mode") or defaults["fee_mode"]),
+            max_fee_gwei=str(data.get("max_fee_gwei") or defaults["max_fee_gwei"] or ""),
+            priority_fee_gwei=str(data.get("priority_fee_gwei") or defaults["priority_fee_gwei"] or ""),
+            public_offset_ms=int(data.get("public_offset_ms") or defaults["public_offset_ms"]),
+            operation_cap=str(data.get("operation_cap") or ""),
+            pending_timeout_seconds=int(defaults["pending_timeout_seconds"]),
+        )
+        return await state.mint.preview(params)
+
+    @app.post("/api/mint/start")
+    async def mint_start(request: Request) -> dict:
+        data = await body(request)
+        return ok(job_id=await state.mint.start(str(data.get("token", "")),
+                                                str(data.get("confirm", ""))))
+
+    @app.get("/api/mint/jobs")
+    async def mint_jobs() -> dict:
+        return {"jobs": state.mint.list_jobs()}
+
+    # ----- safety & settings -----------------------------------------------------------
+    @app.post("/api/stop")
+    async def stop() -> dict:
+        state.safety.stop("STOP pressed in dashboard")
+        return ok(stopped=True)
+
+    @app.post("/api/resume")
+    async def resume(request: Request) -> dict:
+        state.safety.resume(str((await body(request)).get("confirm", "")))
+        return ok(stopped=False)
+
+    @app.get("/api/settings")
+    async def settings_get() -> dict:
+        return {"limits": state.safety.limits_text(), "limit_labels": LIMIT_LABELS,
+                "mint": {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})},
+                "eligibility": {"concurrency": 3, "spacing_seconds": 0.3,
+                                **(state.db.get_setting("eligibility", {}) or {})}}
+
+    @app.post("/api/settings")
+    async def settings_set(request: Request) -> dict:
+        data = await body(request)
+        if "limits" in data:
+            state.safety.set_limits(dict(data["limits"]))
+        if "mint" in data:
+            mint = {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})}
+            for key in DEFAULT_MINT_SETTINGS:
+                if key in data["mint"]:
+                    mint[key] = data["mint"][key]
+            MintParams("x", 0, ["x"], 1, int(mint["gas_limit"]), str(mint["fee_mode"]),
+                       str(mint["max_fee_gwei"] or ""), str(mint["priority_fee_gwei"] or ""),
+                       int(mint["public_offset_ms"]),
+                       pending_timeout_seconds=int(mint["pending_timeout_seconds"])).validate()
+            if not 1 <= int(mint["setup_concurrency"]) <= 50:
+                raise ValueError("setup concurrency must be 1-50")
+            state.db.set_setting("mint", mint)
+        if "eligibility" in data:
+            e = data["eligibility"]
+            concurrency, spacing = int(e.get("concurrency", 3)), float(e.get("spacing_seconds", 0.3))
+            if not 1 <= concurrency <= 10 or not 0 <= spacing <= 10:
+                raise ValueError("eligibility concurrency 1-10, spacing 0-10 seconds")
+            state.db.set_setting("eligibility", {"concurrency": concurrency,
+                                                 "spacing_seconds": spacing})
+        return ok()
+
+    # ----- history ---------------------------------------------------------------------
+    @app.get("/api/history")
+    async def history(limit: int = 200) -> dict:
+        rows = state.db.all("SELECT * FROM history ORDER BY id DESC LIMIT ?", (min(limit, 2000),))
+        for r in rows:
+            for key in ("value_wei", "max_cost_wei", "gas_cost_wei"):
+                r[key.replace("_wei", "")] = from_wei(int(r[key])) if r[key] else None
+        return {"rows": rows}
+
+    @app.get("/api/history.csv")
+    async def history_csv() -> PlainTextResponse:
+        rows = state.db.all("SELECT * FROM history ORDER BY id")
+        cols = ["created_at", "updated_at", "job_id", "operation", "chain_id", "address", "slug",
+                "stage_name", "quantity", "tx_hash", "nonce", "value_wei", "max_cost_wei",
+                "gas_used", "gas_cost_wei", "status", "error", "recipient"]
+        for r in rows:
+            for key in ("created_at", "updated_at"):
+                r[key] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r[key])) + " UTC"
+        return _csv_response(_to_csv(rows, cols), "history.csv")
+
+    # ----- live events -----------------------------------------------------------------
+    @app.get("/api/events")
+    async def events() -> StreamingResponse:
+        queue = state.bus.subscribe()
+
+        async def stream():
+            try:
+                yield "retry: 2000\n\n"
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), 15)
+                        yield f"data: {json.dumps(event, default=str)}\n\n"
+                    except TimeoutError:
+                        yield ": keep-alive\n\n"
+            finally:
+                state.bus.unsubscribe(queue)
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    return app
+
+
+def _to_csv(rows: list[dict], cols: list[str]) -> str:
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(cols)
+    for r in rows:
+        writer.writerow([safe_cell(r.get(c)) for c in cols])
+    return out.getvalue()
+
+
+def _csv_response(text: str, name: str) -> PlainTextResponse:
+    return PlainTextResponse(text, media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{name}"'})

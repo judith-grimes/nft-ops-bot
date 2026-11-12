@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nft-ops"
+version = "0.1.0"
+description = "Local multi-wallet dashboard for OpenSea SeaDrop mints"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  # Same pins as the reviewed osnm-z release (vendored in src/osnm_z).
+  "coincurve==21.0.0",
+  "eth-abi==5.2.0",
+  "eth-account==0.13.7",
+  "eth-typing==6.0.0",
+  "eth-utils==6.0.0",
+  "httpx[http2]==0.28.1",
+  "orjson==3.11.9",
+  # Dashboard and vault.
+  "cryptography>=44",
+  "fastapi>=0.115",
+  "uvicorn>=0.32",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[project.scripts]
+nft-ops = "nft_ops.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nft_ops", "src/osnm_z"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["src/osnm_z"]

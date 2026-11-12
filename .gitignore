@@ -1,0 +1,8 @@
+# Your encrypted vault and database live here. Never commit or share it.
+/data/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.tmp
