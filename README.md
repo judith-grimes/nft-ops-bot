@@ -22,7 +22,7 @@ checked by a test so nobody can quietly change it. See [VENDORED.md](VENDORED.md
 | **Mint** | Pick a phase and wallets, preview every wallet (eligibility, balance, gas, allocation, limits; public phases are simulated on-chain), type `MINT`, and all ready wallets mint in parallel with live status. |
 | **Transfers** | **NFTs:** find your NFTs (ERC-721 and ERC-1155) and consolidate them into one wallet or distribute them to many. **Sweep:** collect ETH or a token from many wallets into one, keeping a gas reserve in each. **Distribute:** send ETH or a token to many addresses: same amount each, split a total equally or by percent, custom amounts, or many-to-many from a CSV. **Address book:** approved outside destinations and saved recipient lists. |
 | **History** | Every mint and transfer with its transaction hash, amount, recipient, cost and result. CSV export. |
-| **Networks** | Several RPC links per chain, with health, speed and automatic fallback. Robinhood Chain (4663) is set up by default. |
+| **Networks** | Several RPC links per chain, with health, speed and automatic fallback. Built in: Robinhood Chain (default), Ethereum, Base, HyperEVM, Monad, Plasma, Arc, XRPL EVM and Elysium (Kinetiq) switched on; Arbitrum, Optimism, Polygon, ApeChain and Elysium (Vulcan Forged) ready to switch on. Any other EVM chain can be added. |
 | **Settings** | Spending limits, mint defaults, scan speed, vault password, lock. |
 
 The red **STOP** button is on every page. It stops anything that has not been sent yet,
@@ -170,6 +170,10 @@ uv sync --frozen --python 3.12
 Your `data` folder is not touched by updates.
 
 ## Known limits
+
+- **EVM chains only.** Solana, Bitcoin, the XRP Ledger itself, Monero and Aptos use different
+  addresses, signatures and RPC formats, so they cannot be added as networks here. For XRP, the
+  **XRPL EVM** sidechain is included.
 
 - Minting supports **OpenSea SeaDrop ERC-721 drops** (the standard OpenSea drop contract) on any
   configured chain. Other mint contracts come in a later stage.

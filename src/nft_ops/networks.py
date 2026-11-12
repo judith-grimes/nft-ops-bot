@@ -14,19 +14,42 @@ import httpx
 from .db import Database
 
 # chain_id, name, native symbol, explorer, enabled, rpc urls
+# Every URL below was checked live with eth_chainId before it was added.
 DEFAULT_NETWORKS: list[tuple[int, str, str, str, bool, list[str]]] = [
     (4663, "Robinhood Chain", "ETH", "https://robinhoodchain.blockscout.com", True,
      ["https://rpc.mainnet.chain.robinhood.com"]),
     (1, "Ethereum", "ETH", "https://etherscan.io", True,
-     ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"]),
+     ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"]),
     (8453, "Base", "ETH", "https://basescan.org", True,
      ["https://mainnet.base.org", "https://base-rpc.publicnode.com"]),
     (42161, "Arbitrum One", "ETH", "https://arbiscan.io", False, ["https://arb1.arbitrum.io/rpc"]),
     (10, "Optimism", "ETH", "https://optimistic.etherscan.io", False,
      ["https://mainnet.optimism.io"]),
-    (137, "Polygon", "POL", "https://polygonscan.com", False, ["https://polygon-rpc.com"]),
+    (137, "Polygon", "POL", "https://polygonscan.com", False,
+     ["https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"]),
     (33139, "ApeChain", "APE", "https://apescan.io", False, ["https://rpc.apechain.com"]),
+    (999, "HyperEVM", "HYPE", "https://hyperevmscan.io", True,
+     ["https://rpc.hyperliquid.xyz/evm", "https://hyperliquid.drpc.org"]),
+    (143, "Monad", "MON", "https://monadscan.com", True,
+     ["https://rpc.monad.xyz", "https://monad-mainnet.drpc.org"]),
+    (9745, "Plasma", "XPL", "https://plasmascan.to", True, ["https://rpc.plasma.to"]),
+    (5042, "Arc", "USDC", "https://explorer.arc.io", True, ["https://rpc.mainnet.arc.io"]),
+    (1440000, "XRPL EVM", "XRP", "https://explorer.xrplevm.org", True,
+     ["https://rpc.xrplevm.org"]),
+    # Kinetiq's Elysium (HyperEVM L2). The only free RPC found is run by the
+    # independent Elyscan explorer; add an official one when Kinetiq publishes it.
+    (99901, "Elysium (Kinetiq)", "HYPE", "https://elyscan.live", True,
+     ["https://rpc.elyscan.live"]),
+    (1339, "Elysium (Vulcan Forged)", "LAVA", "https://blockscout.elysiumchain.tech", False,
+     ["https://rpc.elysiumchain.tech"]),
 ]
+# One-time fixes for databases created by older versions (applied once per version).
+# version -> (dead default URLs to remove, (chain_id, url) defaults to add to existing networks)
+SEED_UPGRADES: dict[int, tuple[list[str], list[tuple[int, str]]]] = {
+    2: (["https://polygon-rpc.com", "https://eth.llamarpc.com"],
+        [(137, "https://polygon-bor-rpc.publicnode.com"), (137, "https://polygon.drpc.org"),
+         (1, "https://eth.drpc.org")]),
+}
 BLOCK_LAG_LIMIT = 30          # blocks behind the best endpoint before it counts as unhealthy
 HEALTH_MAX_AGE_SECONDS = 60   # a mint job re-checks endpoints older than this
 BATCH_CHUNK = 100
@@ -52,6 +75,7 @@ def validate_rpc_url(url: str) -> str:
 
 
 def seed_networks(db: Database) -> None:
+    """Add any built-in network that is missing, then apply one-time upgrades."""
     for chain_id, name, symbol, explorer, enabled, urls in DEFAULT_NETWORKS:
         if db.one("SELECT 1 FROM networks WHERE chain_id = ?", (chain_id,)):
             continue
@@ -65,6 +89,16 @@ def seed_networks(db: Database) -> None:
                 "INSERT INTO rpc_endpoints(chain_id, url, priority) VALUES(?, ?, ?)",
                 (chain_id, url, priority * 10),
             )
+    version = int(db.get_setting("seed_version", 1))
+    for target in sorted(v for v in SEED_UPGRADES if v > version):
+        dead, additions = SEED_UPGRADES[target]
+        for url in dead:
+            db.execute("DELETE FROM rpc_endpoints WHERE url = ?", (url,))
+        for chain_id, url in additions:
+            if db.one("SELECT 1 FROM networks WHERE chain_id = ?", (chain_id,)):
+                db.execute("INSERT OR IGNORE INTO rpc_endpoints(chain_id, url, priority) "
+                           "VALUES(?, ?, 20)", (chain_id, url))
+        db.set_setting("seed_version", target)
 
 
 @dataclass(frozen=True, slots=True)
