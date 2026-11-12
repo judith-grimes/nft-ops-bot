@@ -198,7 +198,7 @@ class RpcPool:
                     if item is None:
                         out.append(RpcError("missing response"))
                     elif "error" in item:
-                        out.append(RpcError(str(item["error"].get("message", "RPC error"))))
+                        out.append(RpcError(_error_text(item["error"])))
                     else:
                         out.append(item.get("result"))
                 return out
@@ -224,15 +224,20 @@ class RpcPool:
             raise RpcError("rate limited")
         if response.status_code >= 400:
             try:
-                message = response.json().get("error", {}).get("message")
+                body = response.json()
             except ValueError:
-                message = None
-            raise RpcError(message or f"HTTP {response.status_code}")
-        body = response.json()
+                body = None
+            message = _error_text(body.get("error")) if isinstance(body, dict) and body.get("error") else None
+            raise RpcError(f"HTTP {response.status_code}: {message}" if message else f"HTTP {response.status_code}")
+        try:
+            body = response.json()
+        except ValueError:
+            raise RpcError("endpoint did not return JSON") from None
+        if isinstance(body, dict) and body.get("error") and "result" not in body:
+            # Provider errors often lack a matching id; show the provider's own message.
+            raise RpcError(_error_text(body["error"]))
         if not isinstance(body, dict) or body.get("id") != envelope["id"]:
             raise RpcError("invalid JSON-RPC response")
-        if "error" in body:
-            raise RpcError(str(body["error"].get("message", "RPC error")))
         return body.get("result")
 
     async def _ensure_chain(self, url: str, chain_id: int) -> None:
@@ -275,8 +280,16 @@ class RpcPool:
             latency = (time.perf_counter() - started) * 500  # average of the two requests
             self._verified[url] = chain_id
             return {"ok": True, "error": None, "latency_ms": round(latency, 1), "block": block}
-        except (RpcError, httpx.HTTPError, ValueError) as error:
-            return {"ok": False, "error": str(error)[:200], "latency_ms": None, "block": None}
+        except Exception as error:  # noqa: BLE001 - a broken endpoint must show as down, not crash
+            return {"ok": False, "error": (str(error) or type(error).__name__)[:200],
+                    "latency_ms": None, "block": None}
+
+
+def _error_text(error: object) -> str:
+    """RPC providers send errors as {"message": ...}, a plain string, or something else."""
+    if isinstance(error, dict):
+        return str(error.get("message") or error)[:300]
+    return str(error)[:300] or "RPC error"
 
 
 def _host(url: str) -> str:

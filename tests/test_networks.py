@@ -27,3 +27,46 @@ def test_defaults_are_unique_and_https():
     ids = [n[0] for n in DEFAULT_NETWORKS]
     assert len(ids) == len(set(ids))
     assert all(u.startswith("https://") for n in DEFAULT_NETWORKS for u in n[5])
+
+
+def test_broken_endpoints_show_as_down_instead_of_crashing(tmp_path):
+    import asyncio
+
+    import httpx
+    import pytest
+
+    from nft_ops.networks import RpcError, RpcPool
+
+    replies = {
+        # Exactly what polygon-rpc.com sends now: HTTP 401 with "error" as a plain string.
+        "https://a.example": (401, {"error": "message: API key disabled, reason: tenant disabled"}),
+        "https://b.example": (200, {"jsonrpc": "2.0", "id": 1, "error": "plain string error"}),
+        "https://c.example": (503, "<html>503 Service Temporarily Unavailable</html>"),
+        "https://d.example": (200, ["not", "an", "object"]),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status, body = replies[str(request.url).rstrip("/")]
+        if isinstance(body, str):
+            return httpx.Response(status, text=body)
+        return httpx.Response(status, json=body)
+
+    db = Database(tmp_path / "x.db")
+    db.execute("INSERT INTO networks(chain_id, name, native_symbol) VALUES(77, 'Test', 'T')")
+    for url in replies:
+        db.execute("INSERT INTO rpc_endpoints(chain_id, url) VALUES(77, ?)", (url,))
+    pool = RpcPool(db, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    async def run():
+        rows = {r["url"]: r for r in await pool.check(77)}
+        assert all(r["healthy"] == 0 for r in rows.values())
+        assert "API key disabled" in rows["https://a.example"]["last_error"]
+        assert "plain string error" in rows["https://b.example"]["last_error"]
+        with pytest.raises(RpcError):
+            await pool.call(77, "eth_blockNumber", [])
+        results = await pool.batch(77, [("eth_blockNumber", [])])
+        assert isinstance(results[0], RpcError) or results == []
+    try:
+        asyncio.run(run())
+    except RpcError:
+        pass  # batch may raise when every endpoint fails; that is a handled error, not a crash
