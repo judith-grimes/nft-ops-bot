@@ -64,6 +64,7 @@ setInterval(() => {
   for (const el of $$("[data-until]")) {
     const left = Number(el.dataset.until) - now;
     el.textContent = left > 0 ? fmtDur(left) : "now";
+    el.classList.toggle("soon", left > 0 && left <= 60);
   }
 }, 1000);
 
@@ -206,7 +207,7 @@ function scheduleRefresh() {
     refreshTimer = null;
     if (S.page === "mint") await renderJobs();
     else if (S.page === "transfers" || S.page === "contracts") await renderTxJobs();
-    else if (S.page === "overview") await render();
+    else if (S.page === "overview") { if (S.mint.preview || $("#jobs")?.childElementCount) await renderJobs(); else await render(); }
   }, 600);
 }
 
@@ -220,32 +221,59 @@ async function render() {
 
 // ---------------------------------------------------------------- overview
 async function renderOverview() {
-  const d = await api("/api/overview");
-  setStopped(d.stopped);
-  d.upcoming.forEach((s) => { s.state = liveState(s); });
+  const [d, ctx, a] = await Promise.all([api("/api/overview"), mintContext(), api("/api/alerts")]);
+  setStopped(d.stopped); setBell(a.unread);
   const c = d.last24h;
+  const w = ctx ? ctx.w : await api(`/api/wallets?chain_id=${S.chainId}`);
+  let elig = {};
+  if (ctx && ctx.stage) {
+    const e = await api(`/api/eligibility?slug=${encodeURIComponent(S.mint.slug)}`);
+    for (const r of e.rows) if (String(r.stage_index) === String(S.mint.stage)) elig[r.address] = r.status;
+    if (ctx.stage.type === "PUBLIC_SALE") elig = Object.fromEntries(w.wallets.map((x) => [x.address, "ELIGIBLE"]));
+  }
+  const phases = [];
+  for (const col of S.collections || []) for (const s of col.stages) if (s.state !== "ended") phases.push({ col, s });
+  phases.sort((x, y) => (x.s.state === "active" ? 0 : 1) - (y.s.state === "active" ? 0 : 1) || x.s.starts_at - y.s.starts_at);
+  const sym = symbol(S.chainId);
+  const ready = w.wallets.filter((x) => x.has_key && elig[x.address] === "ELIGIBLE").length;
   $("#main").innerHTML = `
-    <div class="page-head"><h1>Overview</h1></div>
-    <div class="grid cards">
-      <div class="card"><div class="muted">Wallets</div><div class="big">${d.wallets}</div><div class="tiny muted">${d.with_keys} with keys</div></div>
-      <div class="card"><div class="muted">Eligible wallets</div><div class="big">${d.eligible_wallets}</div><div class="tiny muted">any loaded collection</div></div>
-      ${d.totals.map((t) => `<div class="card"><div class="muted">${esc(t.name)}</div><div class="big">${esc(t.native)} ${esc(t.native_symbol)}</div><div class="tiny muted">${t.nfts} NFTs in tracked collections</div></div>`).join("")}
-      <div class="card"><div class="muted">Last 24 hours</div><div class="big">${c.confirmed || 0} minted</div>
-        <div class="tiny muted">${c.failed || 0} failed · ${(c.pending || 0) + (c.submitted || 0)} pending · ${c.blocked || 0} blocked</div></div>
+    <div class="stat-strip">
+      <div class="stat"><div class="k">Wallets</div><div class="v">${d.wallets}</div></div>
+      <div class="stat"><div class="k">With keys</div><div class="v">${d.with_keys}</div></div>
+      <div class="stat hot"><div class="k">Eligible (any)</div><div class="v">${d.eligible_wallets}</div></div>
+      ${d.totals.map((t) => `<div class="stat"><div class="k">${esc(t.name)}</div><div class="v">${esc(t.native)} <span class="tiny muted">${esc(t.native_symbol)}</span></div></div>`).join("")}
+      <div class="stat hot"><div class="k">Minted 24h</div><div class="v">${c.confirmed || 0}</div></div>
+      <div class="stat"><div class="k">Failed / blocked 24h</div><div class="v">${(c.failed || 0) + (c.blocked || 0)}</div></div>
     </div>
-    <div class="two" style="margin-top:14px">
-      <div class="panel"><h2>Upcoming & active phases</h2>${d.upcoming.length ? `<div class="table-wrap"><table>
-        <tr><th>Collection</th><th>Phase</th><th>State</th><th>Starts</th><th class="num">Eligible</th></tr>
-        ${d.upcoming.map((s) => `<tr><td>${esc(s.slug)}<div class="tiny muted">${esc(s.chain_name)}</div></td><td>${esc(s.name)}</td><td>${badge(s.state)}</td>
-          <td>${s.state === "upcoming" ? countdown(s.starts_at) : "open"}</td><td class="num">${s.eligible_wallets}</td></tr>`).join("")}</table></div>`
-        : `<div class="empty">No upcoming phases. Add a collection.</div>`}</div>
-      <div class="panel"><h2>Active operations</h2>${d.active_jobs.length || d.active_tx_jobs.length ? d.active_jobs.map(jobCard).join("") + d.active_tx_jobs.map(txJobCard).join("") : `<div class="empty">Nothing running.</div>`}</div>
-    </div>
-    <div class="panel"><div class="row"><h2 style="margin:0">Alerts</h2><span class="spacer"></span><button class="small" data-action="alerts">All alerts</button></div>
-      <div id="overview-alerts" style="margin-top:8px"></div></div>
-    <div class="panel"><h2>Recent transactions</h2>${historyTable(d.recent)}</div>`;
-  const a = await api("/api/alerts"); setBell(a.unread);
-  $("#overview-alerts").innerHTML = a.alerts.length ? alertsHTML(a.alerts.slice(0, 6)) : `<div class="empty">No alerts yet. Watched collections report phase openings, changes and sell-outs here.</div>`;
+    <div class="cc-grid">
+      <section class="panel cc-phases"><h2>Phases</h2><div class="cc-scroll">
+        ${phases.length ? phases.map(({ col, s }) => `<div class="phase ${s.state === "active" ? "active" : ""}">
+          <div class="top"><span class="name">${esc(col.slug)}</span><span class="spacer"></span>${badge(s.state === "active" ? "active" : "upcoming")}</div>
+          <div class="tiny muted">${esc(s.name)} · ${esc(col.chain_name)}${col.watch ? " · 👁 watching" : ""}</div>
+          <div class="big-count">${s.state === "active" ? "OPEN" : countdown(s.starts_at)}</div>
+          <div class="row"><span class="meta">${s.price_wei === null ? "price —" : `${esc(weiToStr(s.price_wei))} ${esc(symbol(col.chain_id))}`} · ${s.type === "PUBLIC_SALE" ? "public" : `${s.eligible_wallets} eligible`}</span>
+            <span class="spacer"></span><button class="small primary" data-action="cc-pick" data-slug="${esc(col.slug)}" data-stage="${s.index}">Mint ▸</button></div>
+        </div>`).join("") : `<div class="empty">No open or upcoming phases.<br><button class="small" data-page-link="collections">Add a collection</button></div>`}
+      </div></section>
+      <section class="panel cc-mint">${ctx ? mintPanelHTML(ctx, true) : `<h2>Quick mint</h2><div class="empty">Add a collection first.</div>`}
+        <div id="preview">${S.mint.preview ? previewHTML(S.mint.preview) : ""}</div><div id="jobs"></div></section>
+      <section class="panel cc-alerts"><div class="row"><h2 style="margin:0">Alerts</h2><span class="spacer"></span>${a.unread ? `<button class="small" data-action="alerts-read">Mark read</button>` : ""}</div>
+        <div class="cc-scroll" style="margin-top:8px">${a.alerts.length ? alertsHTML(a.alerts.slice(0, 15)) : `<div class="empty">No alerts yet. Click Watch on a collection to get phase alerts.</div>`}</div></section>
+      <section class="panel cc-wallets">
+        <div class="row"><h2 style="margin:0">Wallets</h2><span class="muted tiny">${ctx && ctx.stage ? `${ready} eligible for ${esc(S.mint.slug)} · ${esc(ctx.stage.name)}` : ""}</span><span class="spacer"></span>
+          <label>Network ${chainSelect("cc-chain", S.chainId)}</label><button class="small" data-action="refresh-balances">Refresh balances</button></div>
+        ${w.wallets.length ? `<div class="table-wrap cc-scroll" style="margin-top:10px;max-height:360px"><table>
+          <tr><th>Wallet</th><th>Groups</th><th>Key</th><th>This phase</th><th class="num">${esc(sym)}</th><th class="num">NFTs</th></tr>
+          ${w.wallets.map((x) => `<tr><td>${addr(x.address, x.label)}</td><td>${x.groups.map((g) => `<span class="chip">${esc(g)}</span>`).join("")}</td>
+            <td>${x.has_key ? `<span class="badge good">key</span>` : `<span class="badge">watch</span>`}</td>
+            <td>${elig[x.address] ? badge(elig[x.address]) : `<span class="muted tiny">—</span>`}</td>
+            <td class="num">${x.native ?? "—"}</td><td class="num">${x.nfts}</td></tr>`).join("")}</table></div>`
+          : `<div class="empty">No wallets yet. <button class="small" data-page-link="wallets">Add wallets</button></div>`}
+      </section>
+    </div>`;
+  if (ctx) bindMintPanel(ctx);
+  $("#cc-chain").onchange = (e) => { S.chainId = Number(e.target.value); localStorageSet("nftops.chain", S.chainId); render(); };
+  await renderJobs();
 }
 
 // ---------------------------------------------------------------- wallets
@@ -385,51 +413,67 @@ async function renderEligibility() {
 
 // ---------------------------------------------------------------- mint
 async function renderMint() {
+  const ctx = await mintContext();
+  if (!ctx) { $("#main").innerHTML = `<div class="page-head"><h1>Mint</h1></div><div class="panel empty">Add a collection first.</div><div id="jobs"></div>`; return renderJobs(); }
+  $("#main").innerHTML = `<div class="page-head"><h1>Mint</h1></div>
+    <div class="panel">${mintPanelHTML(ctx, false)}</div>
+    <div id="preview">${S.mint.preview ? previewHTML(S.mint.preview) : ""}</div>
+    <div id="jobs"></div>`;
+  bindMintPanel(ctx);
+  await renderJobs();
+}
+// Shared by the Mint page and the command center's quick-mint panel.
+async function mintContext() {
   const [cols, w, settings, nets] = await Promise.all([api("/api/collections"), api(`/api/wallets?chain_id=${S.chainId}`), api("/api/settings"), api("/api/networks")]);
   S.collections = liveCollections(cols.collections); S.networks = nets.networks;
   const m = S.mint, def = settings.mint;
-  if (!S.collections.length) { $("#main").innerHTML = `<div class="page-head"><h1>Mint</h1></div><div class="panel empty">Add a collection first.</div><div id="jobs"></div>`; return renderJobs(); }
+  if (!S.collections.length) return null;
   if (!S.collections.some((c) => c.slug === m.slug)) m.slug = S.collections[0].slug;
   const col = S.collections.find((c) => c.slug === m.slug);
   const stages = col.stages.filter((s) => s.state !== "ended");
   if (!stages.some((s) => String(s.index) === String(m.stage))) m.stage = stages.length ? String(stages[0].index) : "";
   const stage = col.stages.find((s) => String(s.index) === String(m.stage));
   m.form = m.form || { quantity: 1, gas_limit: def.gas_limit, fee_mode: def.fee_mode, max_fee_gwei: def.max_fee_gwei, priority_fee_gwei: def.priority_fee_gwei, public_offset_ms: def.public_offset_ms, operation_cap: "" };
-  const f = m.form;
-  $("#main").innerHTML = `
-    <div class="page-head"><h1>Mint</h1></div>
-    <div class="panel">
-      <div class="row">
-        <label>Collection <select id="m-slug">${options(S.collections, m.slug, (c) => `${c.slug} (${c.chain_name})`, (c) => c.slug)}</select></label>
-        <label>Phase <select id="m-stage">${stages.length ? options(stages, m.stage, (s) => `${s.name} — ${s.state}`, (s) => s.index) : "<option>No open phase</option>"}</select></label>
-        ${stage ? `<div class="muted">${stage.state === "upcoming" ? `Opens in ${countdown(stage.starts_at)}` : "Open now"} · price ${stage.price_wei === null ? "—" : esc(weiToStr(stage.price_wei)) + " " + esc(symbol(col.chain_id))} · max ${stage.max_per_wallet ?? "—"}/wallet</div>` : ""}
-      </div>
-      <div class="row" style="margin-top:10px">
-        <label>Wallets <select id="m-source">
-          <option value="eligible" ${m.source === "eligible" ? "selected" : ""}>Eligible for this phase (from scan)</option>
-          <option value="group" ${m.source === "group" ? "selected" : ""}>A group</option>
-          <option value="selected" ${m.source === "selected" ? "selected" : ""}>Selected on Wallets page (${S.selected.size})</option>
-          <option value="all" ${m.source === "all" ? "selected" : ""}>All wallets with keys</option></select></label>
-        ${m.source === "group" ? `<label>Group <select id="m-group">${options(w.groups, m.group, (g) => `${g.name} (${g.size})`, (g) => g.name)}</select></label>` : ""}
-        <label>Quantity / wallet <input id="m-quantity" type="number" min="1" value="${esc(f.quantity)}" style="width:90px"></label>
+  if (m.source === "group" && !m.group && w.groups.length) m.group = w.groups[0].name;
+  return { w, col, stages, stage };
+}
+function mintPanelHTML({ w, col, stages, stage }, compact) {
+  const m = S.mint, f = m.form;
+  const advanced = `
         <label>Gas limit <input id="m-gas" type="number" min="21000" value="${esc(f.gas_limit)}" style="width:110px"></label>
         <label>Fees <select id="m-fee"><option value="auto" ${f.fee_mode === "auto" ? "selected" : ""}>Automatic</option><option value="manual" ${f.fee_mode === "manual" ? "selected" : ""}>Manual</option></select></label>
         ${f.fee_mode === "manual" ? `<label>Max fee (gwei)<input id="m-maxfee" value="${esc(f.max_fee_gwei)}" style="width:100px"></label><label>Priority (gwei)<input id="m-prio" value="${esc(f.priority_fee_gwei)}" style="width:100px"></label>` : ""}
         ${stage && stage.type === "PUBLIC_SALE" ? `<label>Send early (ms)<input id="m-offset" type="number" min="0" max="60000" value="${esc(f.public_offset_ms)}" style="width:100px"></label>` : ""}
-        <label>Max total for this operation (${esc(symbol(col.chain_id))}) <input id="m-cap" value="${esc(f.operation_cap)}" placeholder="limit from Settings" style="width:150px"></label>
+        <label>Max total (${esc(symbol(col.chain_id))}) <input id="m-cap" value="${esc(f.operation_cap)}" placeholder="from Settings" style="width:130px"></label>`;
+  return `
+      ${compact ? `<h2>Quick mint</h2>` : ""}
+      <div class="row">
+        <label>Collection <select id="m-slug">${options(S.collections, m.slug, (c) => `${c.slug} (${c.chain_name})`, (c) => c.slug)}</select></label>
+        <label>Phase <select id="m-stage">${stages.length ? options(stages, m.stage, (s) => `${s.name} — ${s.state}`, (s) => s.index) : "<option>No open phase</option>"}</select></label>
+        ${stage ? `<div class="muted">${stage.state === "upcoming" ? `Opens in ${countdown(stage.starts_at)}` : `<span class="badge good">open now</span>`} · ${stage.price_wei === null ? "—" : esc(weiToStr(stage.price_wei)) + " " + esc(symbol(col.chain_id))} · max ${stage.max_per_wallet ?? "—"}/wallet</div>` : ""}
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label>Wallets <select id="m-source">
+          <option value="eligible" ${m.source === "eligible" ? "selected" : ""}>Eligible for this phase</option>
+          <option value="group" ${m.source === "group" ? "selected" : ""}>A group</option>
+          <option value="selected" ${m.source === "selected" ? "selected" : ""}>Selected wallets (${S.selected.size})</option>
+          <option value="all" ${m.source === "all" ? "selected" : ""}>All wallets with keys</option></select></label>
+        ${m.source === "group" ? `<label>Group <select id="m-group">${options(w.groups, m.group, (g) => `${g.name} (${g.size})`, (g) => g.name)}</select></label>` : ""}
+        <label>Qty / wallet <input id="m-quantity" type="number" min="1" value="${esc(f.quantity)}" style="width:80px"></label>
+        ${compact ? "" : advanced}
         <button class="primary" data-action="preview" ${stage ? "" : "disabled"}>Preview</button>
       </div>
-      <p class="tiny muted">Preview checks every wallet (eligibility, balance, gas, allocation, limits; public phases are also simulated on-chain). Nothing is sent until you confirm.</p>
-    </div>
-    <div id="preview">${m.preview ? previewHTML(m.preview) : ""}</div>
-    <div id="jobs"></div>`;
+      ${compact ? `<details><summary class="tiny muted">Gas, fees and limits</summary><div class="row" style="margin-top:8px">${advanced}</div></details>` : ""}
+      <p class="tiny muted">Preview checks every wallet (eligibility, balance, gas, allocation, limits; open public phases are simulated on-chain). Nothing is sent until you type MINT.</p>`;
+}
+function bindMintPanel({ w }) {
+  const m = S.mint, f = m.form;
   $("#m-slug").onchange = (e) => { m.slug = e.target.value; m.stage = ""; m.preview = null; render(); };
   $("#m-stage").onchange = (e) => { m.stage = e.target.value; m.preview = null; render(); };
   $("#m-source").onchange = (e) => { readMintForm(); m.source = e.target.value; m.preview = null; render(); };
   $("#m-fee").onchange = (e) => { readMintForm(); f.fee_mode = e.target.value; render(); };
   if ($("#m-group")) $("#m-group").onchange = (e) => { m.group = e.target.value; m.preview = null; };
   if (m.source === "group" && !m.group && w.groups.length) m.group = w.groups[0].name;
-  await renderJobs();
 }
 function readMintForm() {
   const f = S.mint.form, v = (id) => ($(id) ? $(id).value : undefined);
@@ -478,6 +522,10 @@ function previewHTML(p) {
 async function renderJobs() {
   const el = $("#jobs"); if (!el) return;
   const d = await api("/api/mint/jobs");
+  if (S.page === "overview") {   // command center: just the latest operations, inline
+    el.innerHTML = d.jobs.slice(0, 2).map(jobCard).join("");
+    return;
+  }
   el.innerHTML = `<div class="panel"><h2>Operations</h2>${d.jobs.length ? d.jobs.map(jobCard).join("") : `<div class="empty">No operations yet.</div>`}</div>`;
 }
 function jobCard(j) {
@@ -589,6 +637,17 @@ async function renderSettings() {
 }
 
 const ACTIONS_EXTRA = {};
+// ---------------------------------------------------------------- theme
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  const b = $("#theme-toggle"); if (b) b.textContent = t === "dark" ? "☀" : "☾";
+}
+applyTheme(localStorageGet("nftops.theme") || "dark");
+$("#theme-toggle").addEventListener("click", () => {
+  const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  localStorageSet("nftops.theme", t); applyTheme(t);
+});
+document.addEventListener("click", (e) => { const l = e.target.closest("[data-page-link]"); if (l) go(l.dataset.pageLink); });
 
 
 // ---------------------------------------------------------------- alerts
@@ -1104,6 +1163,7 @@ const ACTIONS = {
     <label>Type REMOVE to confirm<input id="remove-text" autocomplete="off"></label>
     <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="danger" data-action="remove-go">Remove</button></div>`),
   "remove-go": () => guard(async () => { const r = await api("/api/wallets/remove", { addresses: [...S.selected], confirm: $("#remove-text").value }); S.selected.clear(); closeModal(); toast(`Removed ${r.removed}`); render(); }),
+  "cc-pick": (el) => { S.mint.slug = el.dataset.slug; S.mint.stage = el.dataset.stage; S.mint.preview = null; render(); },
   "mint-selected": () => { S.mint.source = "selected"; S.mint.preview = null; go("mint"); },
   "col-refresh": (el) => guard(async () => { await api("/api/collections", { locator: el.dataset.slug }); toast("Refreshed"); render(); }),
   "col-elig": (el) => { S.elig.slug = el.dataset.slug; go("eligibility"); },
