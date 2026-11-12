@@ -167,10 +167,113 @@ def test_signature_and_argument_validation():
     assert contracts.canonical("mint( uint256 , bytes32[] )") == "mint(uint256,bytes32[])"
     with pytest.raises(ContractError):
         contracts.parse_signature("mint(uint256")
-    with pytest.raises(ContractError, match="struct"):
-        contracts.parse_signature("claim((bytes32[],uint256))")
+    assert contracts.parse_signature("claim((bytes32[],uint256),bytes)")[1] == ["(bytes32[],uint256)", "bytes"]
+    with pytest.raises(ContractError):
+        contracts.parse_signature("claim((bytes32[],uint256)")
+    with pytest.raises(ContractError):
+        contracts.parse_signature("claim((float,uint256))")
     with pytest.raises(ContractError):
         contracts.coerce("uint256", "-1")
     with pytest.raises(ContractError):
         contracts.coerce("bytes32", "0x1234")
     assert contracts.coerce("bytes32[]", "0x" + "11" * 32 + " 0x" + "22" * 32)[1] == b"\x22" * 32
+
+
+def test_send_when_sale_opens(env):
+    async def run():
+        opens = time.time() + 2.0
+        drop, wallets, engine = _setup(env, sale_start=opens)
+        sent_at = []
+        original = env.chain._dispatch
+
+        async def spy(method, params):
+            if method == "eth_sendRawTransaction":
+                sent_at.append(time.time())
+            return await original(method, params)
+        env.chain._dispatch = spy
+        items, notes = custommint.plan(env.db, CHAIN, DROP, "mint(uint256)", ["{quantity}"], 1, "0.002",
+                                       wallets, gas_limit=200_000, wait_for_open_minutes=1)
+        assert "every new block" in notes[-1]
+        preview = await engine.preview("custom_mint", CHAIN, items, "t")
+        assert preview["totals"]["ready"] == 2 and "fails now" in preview["rows"][0]["reason"]
+        job_id = await engine.start(preview["token"], "MINT")
+        await asyncio.sleep(0.8)
+        assert {r.phase for r in engine.jobs[job_id].runs} == {"waiting"} and env.chain.sent == []
+        await asyncio.wait_for(engine.jobs[job_id].task, 30)
+        assert [r.phase for r in engine.jobs[job_id].runs] == ["confirmed", "confirmed"]
+        assert engine.jobs[job_id].open_state == "opened"
+        assert all(opens <= t < opens + 1.5 for t in sent_at)      # fired right after opening
+    asyncio.run(run())
+
+
+def test_sale_that_never_opens_sends_nothing(env):
+    async def run():
+        drop, wallets, engine = _setup(env, sale_start=time.time() + 3600)
+        items, _ = custommint.plan(env.db, CHAIN, DROP, "mint(uint256)", ["{quantity}"], 1, "0.002",
+                                   wallets, gas_limit=200_000, wait_for_open_minutes=1)
+        for item in items:
+            item.wait_for_open = 1.0                                 # shorten the wait for the test
+        preview = await engine.preview("custom_mint", CHAIN, items, "t")
+        job_id = await engine.start(preview["token"], "MINT")
+        await asyncio.wait_for(engine.jobs[job_id].task, 30)
+        runs = engine.jobs[job_id].runs
+        assert {r.phase for r in runs} == {"cancelled"} and "did not open" in runs[0].message
+        assert env.chain.sent == []
+        # STOP while waiting also cancels without sending.
+        items, _ = custommint.plan(env.db, CHAIN, DROP, "mint(uint256)", ["{quantity}"], 1, "0.002",
+                                   wallets, gas_limit=200_000, wait_for_open_minutes=1)
+        preview = await engine.preview("custom_mint", CHAIN, items, "t")
+        job_id = await engine.start(preview["token"], "MINT")
+        await asyncio.sleep(0.5)
+        env.safety.stop("test")
+        await asyncio.wait_for(engine.jobs[job_id].task, 5)
+        assert {r.phase for r in engine.jobs[job_id].runs} == {"cancelled"}
+        assert "STOP" in engine.jobs[job_id].runs[0].message and env.chain.sent == []
+        with pytest.raises(ContractError, match="either"):
+            custommint.plan(env.db, CHAIN, DROP, "mint(uint256)", ["{quantity}"], 1, "0", wallets,
+                            start_at=time.time() + 60, gas_limit=200_000, wait_for_open_minutes=5)
+    asyncio.run(run())
+
+
+def test_thirdweb_style_claim_with_struct_input(env):
+    from eth_abi import decode
+    from eth_utils.crypto import keccak
+
+    sig = "claim(address,uint256,address,uint256,(bytes32[],uint256,uint256,address),bytes)"
+    wallets = env.wallets.generate(1)
+    proof = "0x" + "cd" * 32
+    items, _ = custommint.plan(
+        env.db, CHAIN, DROP, sig,
+        ["{wallet}", "{quantity}", "{native}", "{price_wei}",
+         '["{proof}", 0, "{price_wei}", "{native}"]', "0x"],
+        3, "0.002", wallets, json.dumps({wallets[0]: [proof]}))
+    item = items[0]
+    assert item.status == "READY" and item.value == 3 * 2 * 10**15
+    assert item.data[:4] == keccak(text=sig)[:4]
+    args = decode(["address", "uint256", "address", "uint256", "(bytes32[],uint256,uint256,address)", "bytes"],
+                  item.data[4:])
+    assert args[0].lower() == wallets[0].lower() and args[1] == 3
+    assert args[2].lower() == contracts.NATIVE_PLACEHOLDER.lower() and args[3] == 2 * 10**15
+    assert list(args[4][0]) == [bytes.fromhex("cd" * 32)] and args[4][2] == 2 * 10**15 and args[5] == b""
+    with pytest.raises(ContractError, match="JSON list"):
+        custommint.plan(env.db, CHAIN, DROP, sig, ["{wallet}", "1", "{native}", "0", "not json", "0x"],
+                        1, "0", wallets)
+
+
+def test_analyser_recognises_struct_claim_from_abi(env):
+    async def run():
+        _setup(env)
+        abi = [{"type": "function", "name": "claim", "stateMutability": "payable", "outputs": [], "inputs": [
+            {"name": "_receiver", "type": "address"}, {"name": "_quantity", "type": "uint256"},
+            {"name": "_currency", "type": "address"}, {"name": "_pricePerToken", "type": "uint256"},
+            {"name": "_allowlistProof", "type": "tuple", "components": [
+                {"name": "proof", "type": "bytes32[]"}, {"name": "quantityLimitPerWallet", "type": "uint256"},
+                {"name": "pricePerToken", "type": "uint256"}, {"name": "currency", "type": "address"}]},
+            {"name": "_data", "type": "bytes"}]}]
+        drop = env.chain.custom[DROP.lower()]
+        drop.SIGS = drop.SIGS + ("claim(address,uint256,address,uint256,(bytes32[],uint256,uint256,address),bytes)",)
+        report = await contracts.analyze(env.db, env.pool, CHAIN, DROP, json.dumps(abi))
+        (f,) = report["mint_functions"]
+        assert f["signature"].startswith("claim(address,uint256,address,uint256,(bytes32[]")
+        assert "Merkle" in f["needs"]           # not mistaken for a project signature
+    asyncio.run(run())

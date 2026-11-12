@@ -124,6 +124,8 @@ def test_many_to_many_and_insufficient_funds(env):
         preview = await engine.preview("distribute", CHAIN, items, "pairs")
         status = {r["source"]: r["status"] for r in preview["rows"]}
         assert status == {a: "READY", b: "INSUFFICIENT_FUNDS"}
+        short_b = next(r["shortfall"] for r in preview["rows"] if r["source"] == b)
+        assert 0.499 < float(short_b) < 0.5005           # 0.5 to send + gas, minus 0.001 held
         job_id = await engine.start(preview["token"], "SEND")
         await asyncio.wait_for(engine.jobs[job_id].task, 30)
         assert [r.item.source for r in engine.jobs[job_id].runs] == [a]   # only ready rows run
@@ -154,7 +156,10 @@ def test_stop_blocks_remaining_transfers(env):
                                                    each="0.01")
         preview = await engine.preview("distribute", CHAIN, items, "t")
         job_id = await engine.start(preview["token"], "SEND")
-        await asyncio.sleep(0.45)                     # first send done, second in flight
+        for _ in range(200):                          # wait until the 2nd send is in flight
+            if sum(env.chain.sends_by_port.values()) >= 2:
+                break
+            await asyncio.sleep(0.01)
         env.safety.stop("test")
         await asyncio.wait_for(engine.jobs[job_id].task, 30)
         phases = [r.phase for r in engine.jobs[job_id].runs]

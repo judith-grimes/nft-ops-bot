@@ -20,13 +20,20 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 
 from osnm_z.opensea_protocol import ProtocolError
 
 from . import (
     __version__,
     addressbook,
+    backup,
     balances,
     collections,
     contracts,
@@ -44,6 +51,7 @@ from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
 from .monitor import Monitor
 from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
 from .nfts import NftError
+from .replace import ReplaceError, Replacer
 from .safety import LIMIT_LABELS, Safety, from_wei
 from .txengine import TxEngine, TxEngineError
 from .vault import Vault, VaultError
@@ -51,7 +59,7 @@ from .wallets import WalletError, WalletService, checksum, safe_cell
 
 STATIC = Path(__file__).parent / "static"
 USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
-               ContractError,
+               ContractError, ReplaceError, backup.BackupError,
                RpcError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
@@ -73,11 +81,33 @@ class AppState:
         self.sessions: set[str] = set()
         self.scan_task: asyncio.Task | None = None
         self.scan_progress: dict[str, Any] = {}
+        self.data_dir = data_dir
+        self.last_activity = time.time()
         self.tx = TxEngine(self.db, self.vault, self.pool, self.bus, self.safety)
+        self.replacer = Replacer(self.tx)
         # A wallet can be in a mint or a transfer operation, never both (nonce safety).
         self.tx.external_busy = self.mint.active_wallets.get
         self.mint.external_busy = self.tx.busy_sources.get
         self.monitor = Monitor(self.db, self.pool, self.bus, self.opensea_factory, self.auto_rescan)
+
+    def busy(self) -> bool:
+        """Anything running that must not be interrupted by an automatic lock."""
+        return bool(self.mint.active_wallets or self.tx.busy_sources
+                    or (self.scan_task and not self.scan_task.done()))
+
+    def auto_lock_minutes(self) -> int:
+        return int((self.db.get_setting("security", {}) or {}).get("auto_lock_minutes", 30))
+
+    def maybe_auto_lock(self, now: float | None = None) -> bool:
+        minutes = self.auto_lock_minutes()
+        now = time.time() if now is None else now
+        if (minutes <= 0 or not self.vault.unlocked or self.busy()
+                or now - self.last_activity < minutes * 60):
+            return False
+        self.vault.lock()
+        self.sessions.clear()
+        self.bus.publish("locked", reason=f"locked after {minutes} min without activity")
+        return True
 
     async def auto_rescan(self, slug: str) -> dict | None:
         """Monitor-triggered eligibility re-check (skipped if a manual scan is running)."""
@@ -107,11 +137,21 @@ def create_app(state: AppState, port: int) -> FastAPI:
                 await asyncio.sleep(60)
         task = asyncio.create_task(health_loop())
         monitor_task = asyncio.create_task(state.monitor.run_forever())
+
+        async def lock_loop() -> None:
+            while True:
+                await asyncio.sleep(15)
+                try:
+                    state.maybe_auto_lock()
+                except Exception:  # noqa: BLE001 - never let the loop die
+                    pass
+        lock_task = asyncio.create_task(lock_loop())
         try:
             yield
         finally:
             task.cancel()
             monitor_task.cancel()
+            lock_task.cancel()
 
     app = FastAPI(title="nft-ops", docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)
@@ -129,6 +169,8 @@ def create_app(state: AppState, port: int) -> FastAPI:
             token = request.headers.get("x-session", "")
             if not token or token not in state.sessions:
                 return JSONResponse({"error": "locked", "locked": True}, status_code=401)
+            if path not in ("/api/events", "/api/alerts"):   # background polling is not activity
+                state.last_activity = time.time()
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Frame-Options"] = "DENY"
@@ -197,6 +239,15 @@ def create_app(state: AppState, port: int) -> FastAPI:
         state.vault.lock()
         state.sessions.clear()
         return ok()
+
+    @app.post("/api/backup")
+    async def make_backup(request: Request) -> Response:
+        data = await body(request)
+        if not await asyncio.to_thread(state.vault.verify, str(data.get("password", ""))):
+            raise VaultError("wrong password")
+        content, name = await asyncio.to_thread(backup.create, state.data_dir, state.db)
+        return Response(content, media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     @app.post("/api/vault/password")
     async def vault_password(request: Request) -> dict:
@@ -488,6 +539,9 @@ def create_app(state: AppState, port: int) -> FastAPI:
     async def settings_get() -> dict:
         return {"limits": state.safety.limits_text(), "limit_labels": LIMIT_LABELS,
                 "monitor": state.monitor.settings(),
+                "security": {"auto_lock_minutes": state.auto_lock_minutes()},
+                "network": {"broadcast_all": bool((state.db.get_setting("network", {}) or {})
+                                                  .get("broadcast_all", True))},
                 "mint": {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})},
                 "eligibility": {"concurrency": 3, "spacing_seconds": 0.3,
                                 **(state.db.get_setting("eligibility", {}) or {})}}
@@ -509,6 +563,13 @@ def create_app(state: AppState, port: int) -> FastAPI:
             if not 1 <= int(mint["setup_concurrency"]) <= 50:
                 raise ValueError("setup concurrency must be 1-50")
             state.db.set_setting("mint", mint)
+        if "security" in data:
+            minutes = int(data["security"].get("auto_lock_minutes", 30))
+            if not 0 <= minutes <= 1440:
+                raise ValueError("auto-lock must be 0 (off) to 1440 minutes")
+            state.db.set_setting("security", {"auto_lock_minutes": minutes})
+        if "network" in data:
+            state.db.set_setting("network", {"broadcast_all": bool(data["network"].get("broadcast_all", True))})
         if "eligibility" in data:
             e = data["eligibility"]
             concurrency, spacing = int(e.get("concurrency", 3)), float(e.get("spacing_seconds", 0.3))
@@ -546,7 +607,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
             [str(a) for a in data.get("args", [])], int(data.get("quantity", 1)),
             str(data.get("price", "0")), wallets, str(data.get("proofs", "")), start_at,
             int(data.get("gas_limit") or 0), bool(data.get("resimulate", True)),
-            str(data.get("label", ""))[:30])
+            str(data.get("label", ""))[:30], float(data.get("wait_for_open_minutes") or 0))
         return await state.tx.preview("custom_mint", chain_id, items, "Custom mint",
                                       str(data.get("cap") or ""), notes)
 
@@ -685,6 +746,16 @@ def create_app(state: AppState, port: int) -> FastAPI:
         data = await body(request)
         return ok(job_id=await state.tx.start(str(data.get("token", "")),
                                               str(data.get("confirm", ""))))
+
+    @app.post("/api/tx/replace/preview")
+    async def replace_preview(request: Request) -> dict:
+        data = await body(request)
+        return await state.replacer.preview(int(data["history_id"]), str(data.get("mode", "speedup")))
+
+    @app.post("/api/tx/replace/send")
+    async def replace_send(request: Request) -> dict:
+        data = await body(request)
+        return ok(**await state.replacer.execute(str(data.get("token", "")), str(data.get("confirm", ""))))
 
     @app.get("/api/tx/jobs")
     async def tx_jobs() -> dict:

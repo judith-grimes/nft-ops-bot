@@ -65,3 +65,54 @@ def test_transfer_send_falls_back_but_rpc_errors_do_not(env):
         assert [r.phase for r in engine.jobs[job_id].runs] == ["confirmed"]
         assert len(env.chain.sent) == 1
     asyncio.run(run())
+
+
+def test_broadcast_reaches_every_rpc_but_sends_once(env):
+    async def run():
+        _add_backup(env)
+        env.safety.set_limits({"max_transfer_per_operation": "10", "max_daily": "10"})
+        payers = env.wallets.generate(2)
+        for p in payers:
+            env.chain.balances[p.lower()] = 10**18
+        engine = TxEngine(env.db, env.vault, env.pool, env.bus, env.safety)
+        await env.pool.check(4663)
+        rows = [{"source": payers[0], "address": "0x00000000000000000000000000000000000000a1", "amount": "0.01"},
+                {"source": payers[1], "address": "0x00000000000000000000000000000000000000a2", "amount": "0.01"}]
+        items, _ = await transfers.plan_distribute(env.db, env.pool, 4663, "pairs", "native", rows)
+        preview = await engine.preview("distribute", 4663, items, "t")
+        job_id = await engine.start(preview["token"], "SEND")
+        await asyncio.wait_for(engine.jobs[job_id].task, 30)
+        await asyncio.sleep(0.2)                                   # background deliveries finish
+        assert [r.phase for r in engine.jobs[job_id].runs] == ["confirmed", "confirmed"]
+        assert len(env.chain.sent) == 2                            # one transaction per wallet
+        assert env.chain.sends_by_port == {8545: 2, 8546: 2}       # each went to both RPCs
+        # With broadcast switched off, only the primary is used.
+        env.db.set_setting("network", {"broadcast_all": False})
+        env.chain.sends_by_port.clear()
+        items, _ = await transfers.plan_distribute(env.db, env.pool, 4663, "pairs", "native", rows[:1])
+        preview = await engine.preview("distribute", 4663, items, "t")
+        job_id = await engine.start(preview["token"], "SEND")
+        await asyncio.wait_for(engine.jobs[job_id].task, 30)
+        assert sum(env.chain.sends_by_port.values()) == 1
+    asyncio.run(run())
+
+
+def test_mint_broadcast_sends_each_wallet_once(env):
+    async def run():
+        _add_backup(env)
+        wallets = env.wallets.generate(2)
+        for w in wallets:
+            env.chain.balances[w.lower()] = 10**18
+        meta = allowlist_metadata(time.time() - 60, time.time() + 3600)
+        engine = MintEngine(env.db, env.vault, env.pool, env.bus, env.safety,
+                            lambda: FakeOpenSea(meta, set(wallets)), env.gateway_factory())
+        await env.pool.check(4663)
+        await eligibility.scan(env.db, engine.opensea_factory, env.vault, meta, wallets, spacing_seconds=0)
+        preview = await engine.preview(MintParams("fake-drop", 1, wallets))
+        job_id = await engine.start(preview["token"], "MINT")
+        await asyncio.wait_for(engine.jobs[job_id].task, 30)
+        await asyncio.sleep(0.2)
+        assert [r.phase for r in engine.jobs[job_id].runs.values()] == ["confirmed", "confirmed"]
+        assert len(env.chain.sent) == 2
+        assert env.chain.sends_by_port == {8545: 2, 8546: 2}
+    asyncio.run(run())

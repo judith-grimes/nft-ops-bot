@@ -38,7 +38,8 @@ CONFIRM_WORD = "SEND"
 CONFIRM_WORDS = {"custom_mint": "MINT"}
 KIND_LABELS = {"sweep": "Fund sweep", "distribute": "Fund distribution",
                "nft_transfer": "NFT transfer", "custom_mint": "Custom mint"}
-PREFETCH_SECONDS = 3.0         # scheduled sends refresh nonce and balance this long before launch
+PREFETCH_SECONDS = 3.0
+SALE_POLL_SECONDS = 0.25       # how often to look for a new block while waiting for a sale         # scheduled sends refresh nonce and balance this long before launch
 
 
 class TxEngineError(Exception):
@@ -64,6 +65,8 @@ class TxItem:
     scheduled_at: float | None = None   # unix time to send at (custom mints)
     resimulate: bool = True             # re-run eth_estimateGas right before a scheduled send
     fixed_gas: int = 0                  # user gas limit; used when the sale is not open yet
+    shortfall: int = 0                  # native coin the wallet is missing (set in preview)
+    wait_for_open: float = 0.0          # >0: send when the sale opens; max wait in seconds
     gas_limit: int = 0
     status: str = "READY"
     reason: str = ""
@@ -80,6 +83,7 @@ class TxItem:
             "amount": self.amount, "token_id": self.token_id, "external": self.external,
             "gas_limit": self.gas_limit, "max_gas_cost": from_wei(self.gas_limit * max_fee),
             "status": self.status, "reason": self.reason,
+            "shortfall": from_wei(self.shortfall) if self.shortfall else None,
         }
 
 
@@ -120,9 +124,12 @@ class TxJob:
     created_at: float = field(default_factory=time.time)
     task: asyncio.Task | None = None
     tasks: list[asyncio.Task] = field(default_factory=list)
+    open_event: asyncio.Event | None = None     # set when the sale-open watcher finishes
+    open_state: str = ""                        # opened | timeout | stopped
 
     def summary(self) -> dict:
         return {"id": self.id, "kind": self.preview.kind, "title": self.preview.title,
+                "open_state": self.open_state,
                 "status": self.status, "chain_id": self.preview.chain_id,
                 "created_at": self.created_at, "runs": [r.summary() for r in self.runs]}
 
@@ -200,9 +207,15 @@ class TxEngine:
             if needed > balance:
                 for i in mine:
                     if i.status == "READY":
+                        i.shortfall = needed - balance
                         i.status = "INSUFFICIENT_FUNDS"
                         i.reason = (f"wallet needs {from_wei(needed)} incl. max gas, "
                                     f"has {from_wei(balance)}")
+            for i in items:
+                # Shortfall for wallets whose test run already failed for lack of funds.
+                if i.source == source and i.status == "INSUFFICIENT_FUNDS" and not i.shortfall:
+                    gas = i.gas_limit or i.fixed_gas or 150_000
+                    i.shortfall = max(0, i.value + gas * max_fee - balance)
             for i in mine:
                 gas_cost = i.gas_limit * max_fee
                 if i.status == "READY" and gas_cost > limits["max_gas_cost_per_tx"]:
@@ -275,7 +288,8 @@ class TxEngine:
                     text = str(error)[:200]
                     if "insufficient funds" in text.lower():
                         item.status, item.reason = "INSUFFICIENT_FUNDS", text
-                    elif item.scheduled_at and item.scheduled_at > time.time() and item.fixed_gas:
+                    elif item.fixed_gas and (item.wait_for_open or
+                                             (item.scheduled_at and item.scheduled_at > time.time())):
                         # Before launch most mints revert ("sale not active"). Use the user's gas
                         # limit and decide at launch.
                         item.gas_limit = item.fixed_gas
@@ -335,9 +349,16 @@ class TxEngine:
             by_source: dict[str, list[TxRun]] = {}
             for run in job.runs:
                 by_source.setdefault(run.item.source, []).append(run)
+            watcher = None
+            probes = [r.item for r in job.runs if r.item.wait_for_open]
+            if probes:
+                job.open_event = asyncio.Event()
+                watcher = asyncio.create_task(self._watch_sale_open(job, probes))
             job.tasks = [asyncio.create_task(self._run_source(job, runs))
                          for runs in by_source.values()]
             await asyncio.gather(*job.tasks, return_exceptions=True)
+            if watcher is not None and not watcher.done():
+                watcher.cancel()
         finally:
             for run in job.runs:
                 if run.phase == "queued":
@@ -356,6 +377,17 @@ class TxEngine:
         sent: list[TxRun] = []
         try:
             signer = self.vault.signer(source)
+            if any(r.item.wait_for_open for r in runs) and job.open_event is not None:
+                for run in runs:
+                    run.phase, run.message = "waiting", "waiting for the sale to open (test run every block)"
+                    self._publish(job, run)
+                await job.open_event.wait()
+                if job.open_state != "opened":
+                    why = ("STOP pressed while waiting" if job.open_state == "stopped"
+                           else "the sale did not open within the maximum wait")
+                    for run in runs:
+                        self._finish(job, run, "cancelled", f"{why}; nothing sent")
+                    return
             launch = min((r.item.scheduled_at for r in runs if r.item.scheduled_at), default=None)
             if launch and launch > time.time():
                 for run in runs:
@@ -375,7 +407,7 @@ class TxEngine:
                 return
             for index, run in enumerate(runs):
                 item = run.item
-                if item.scheduled_at and item.resimulate and item.data:
+                if (item.scheduled_at or item.wait_for_open) and item.resimulate and item.data:
                     problem = await self._recheck(preview.chain_id, item)
                     if problem:
                         self._finish(job, run, "not_submitted", f"skipped, test run at launch failed: {problem}")
@@ -428,6 +460,39 @@ class TxEngine:
         finally:
             await self._track(job, sent)
 
+    async def _watch_sale_open(self, job: TxJob, probes: list[TxItem]) -> None:
+        """Test-run a mint on every new block; open the gate for all wallets once it passes."""
+        deadline = time.time() + max(p.wait_for_open for p in probes)
+        chain_id, last_block, index = job.preview.chain_id, None, 0
+        try:
+            while True:
+                if self.safety.stopped:
+                    job.open_state = "stopped"
+                    return
+                if time.time() > deadline:
+                    job.open_state = "timeout"
+                    return
+                try:
+                    block = await self.pool.call(chain_id, "eth_blockNumber", [])
+                except RpcError:
+                    block = None
+                if block is not None and block != last_block:
+                    last_block = block
+                    probe = probes[index % len(probes)]
+                    problem = await self._recheck(chain_id, probe)
+                    if problem is None:
+                        job.open_state = "opened"
+                        self.bus.publish("sale_open", job=job.id, block=block)
+                        return
+                    if "insufficient funds" in problem.lower():
+                        index += 1      # this wallet cannot prove it; try the next one
+                await asyncio.sleep(SALE_POLL_SECONDS)
+        finally:
+            if not job.open_state:
+                job.open_state = "stopped"
+            if job.open_event is not None:
+                job.open_event.set()
+
     async def _wait_until(self, target: float) -> bool:
         """Sleep until `target` (unix time). Returns False if STOP is pressed meanwhile."""
         while True:
@@ -466,12 +531,15 @@ class TxEngine:
 
     async def _send(self, chain_id: int, url: str, raw: str, local_hash: str) -> None:
         try:
-            returned, used = await self.pool.send_raw(chain_id, url, raw)
+            broadcast = bool((self.db.get_setting("network", {}) or {}).get("broadcast_all", True))
+            returned, used = await self.pool.send_raw(chain_id, url, raw, broadcast)
+            if returned is None:   # a node said "already known": it has our transaction
+                return
         except RpcError as error:
             if "already known" in str(error).lower():
                 return
             raise
-        if used != url:
+        if used != url and not broadcast:
             self.bus.publish("failover", chain_id=chain_id, operation="transfer")
         if not isinstance(returned, str) or returned.lower() != local_hash.lower():
             raise RpcError("RPC returned a different transaction hash")

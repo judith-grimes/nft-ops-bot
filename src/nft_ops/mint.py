@@ -244,6 +244,8 @@ class MintEngine:
                     "max_gas_cost": from_wei(gas_cost_max), "worst_case": from_wei(value + gas_cost_max),
                     "balance": None if isinstance(balance_raw, RpcError) else from_wei(int(balance_raw, 16)),
                     "status": status, "reason": reason, "simulation": "",
+                    "shortfall": (from_wei(value + gas_cost_max - int(balance_raw, 16))
+                                  if status in ("INSUFFICIENT_BALANCE", "INSUFFICIENT_GAS") else None),
                     "_worst": value + gas_cost_max,
                 })
 
@@ -532,6 +534,7 @@ class MintEngine:
         if not hasattr(gateway, "set_backups"):
             return
         gateway.set_backups([u for u in self.pool.healthy_urls(chain_id) if u != primary])
+        gateway.broadcast = bool((self.db.get_setting("network", {}) or {}).get("broadcast_all", True))
 
         def on_failover(_primary: str, _used: str, error: object) -> None:
             self.bus.publish("failover", chain_id=chain_id, operation="mint", job=job.id,

@@ -187,6 +187,10 @@ class Database:
     def close(self) -> None:
         self._conn.close()
 
+    def backup_to(self, target: sqlite3.Connection) -> None:
+        with self._lock:
+            self._conn.backup(target)
+
     def execute(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._conn.execute(sql, params)

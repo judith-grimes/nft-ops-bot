@@ -41,6 +41,8 @@ KNOWN_MINTS = [
     "allowlistMint(uint256,bytes32[])", "allowlistMint(bytes32[],uint256)",
     "fcfsMint(uint256,bytes32[])", "freeMint()", "freeMint(uint256)", "claim()", "claim(uint256)",
     "claim(address,uint256)", "purchase(uint256)", "buy(uint256)",
+    # thirdweb DropERC721 / OpenEditionERC721
+    "claim(address,uint256,address,uint256,(bytes32[],uint256,uint256,address),bytes)",
 ]
 # No-argument read functions and how to decode their result.
 KNOWN_READS: dict[str, str] = {
@@ -73,20 +75,66 @@ class ContractError(Exception):
     pass
 
 
+_BASIC = re.compile(r"(uint(8|16|32|64|128|256)?|int(8|16|32|64|128|256)?|address|bool|"
+                    r"bytes([1-9]|[12][0-9]|3[0-2])?|string)")
+_ARRAY_SUFFIX = re.compile(r"(\[\d*\])*")
+NATIVE_PLACEHOLDER = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"   # "native coin" in thirdweb-style drops
+
+
+def split_top(text: str) -> list[str]:
+    """Split on commas that are not inside parentheses."""
+    parts, depth, current = [], 0, ""
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                raise ContractError("unbalanced parentheses in function signature")
+        if ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    if depth:
+        raise ContractError("unbalanced parentheses in function signature")
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _tuple_parts(kind: str) -> tuple[list[str], str]:
+    """'(a,b)[]' -> (['a', 'b'], '[]')."""
+    depth = 0
+    for i, ch in enumerate(kind):
+        depth += ch == "("
+        depth -= ch == ")"
+        if depth == 0:
+            return split_top(kind[1:i]), kind[i + 1:]
+    raise ContractError("unbalanced parentheses in function signature")
+
+
+def check_type(kind: str) -> None:
+    if kind.startswith("("):
+        parts, suffix = _tuple_parts(kind)
+        if not parts or not _ARRAY_SUFFIX.fullmatch(suffix):
+            raise ContractError(f"unsupported parameter type {kind}")
+        for part in parts:
+            check_type(part)
+        return
+    base = re.match(r"[a-z]+\d*", kind)
+    if not base or not _BASIC.fullmatch(base.group()) or not _ARRAY_SUFFIX.fullmatch(kind[base.end():]):
+        raise ContractError(f"unsupported parameter type {kind}")
+
+
 def parse_signature(signature: str) -> tuple[str, list[str]]:
-    """'mint(uint256,bytes32[])' -> ('mint', ['uint256', 'bytes32[]'])."""
+    """'claim(address,(bytes32[],uint256),bytes)' -> ('claim', ['address', '(bytes32[],uint256)', 'bytes'])."""
     match = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*", signature)
     if not match:
         raise ContractError("function must look like name(type,type)")
-    inner = match.group(2).replace(" ", "")
-    if "(" in inner:
-        raise ContractError("functions with struct (tuple) parameters are not supported yet")
-    types = [t for t in inner.split(",") if t]
-    allowed = re.compile(r"(uint(8|16|32|64|128|256)?|int(8|16|32|64|128|256)?|address|bool|"
-                         r"bytes([1-9]|[12][0-9]|3[0-2])?|string)(\[\])?")
+    types = split_top(match.group(2).replace(" ", ""))
     for t in types:
-        if not allowed.fullmatch(t):
-            raise ContractError(f"unsupported parameter type {t}")
+        check_type(t)
     return match.group(1), types
 
 
@@ -261,10 +309,13 @@ async def analyze(db: Database, pool: RpcPool, chain_id: int, address: str,
     restrictions = []
     for f in candidates:
         types = [i["type"] for i in f["inputs"]]
-        if "bytes32[]" in types:
-            f["needs"] = "Merkle proof (allowlist) per wallet"
-        elif "bytes" in types:
+        names = " ".join(i.get("name", "") for i in f["inputs"]).lower()
+        if "sig" in names or "signature" in f["name"].lower():
             f["needs"] = "signature from the project per wallet (not supported for custom mints)"
+        elif "bytes32[]" in f["signature"]:
+            f["needs"] = "Merkle proof (allowlist) per wallet"
+        elif any(t.startswith("(") for t in types):
+            f["needs"] = "a bundled (struct) input — fill it as a JSON list"
         else:
             f["needs"] = ""
     if reads.get("paused()") is True:
@@ -330,9 +381,22 @@ def encode_call(signature: str, args: list[Any]) -> bytes:
 
 def coerce(kind: str, value: Any) -> Any:
     """Turn a form value into the Python value eth_abi expects for `kind`."""
-    if kind.endswith("[]"):
-        items = value if isinstance(value, list) else [v for v in str(value).replace(",", " ").split() if v]
-        return [coerce(kind[:-2], v) for v in items]
+    if kind.startswith("(") and not kind.endswith("]"):
+        parts, _ = _tuple_parts(kind)
+        items = _json_list(value, kind)
+        if len(items) != len(parts):
+            raise ContractError(f"{kind} needs {len(parts)} values in a list, got {len(items)}")
+        return tuple(coerce(p, v) for p, v in zip(parts, items, strict=True))
+    if kind.endswith("]"):
+        inner = kind[:kind.rindex("[")]
+        if inner.startswith("(") or isinstance(value, list) or str(value).strip().startswith("["):
+            items = _json_list(value, kind)
+        else:
+            items = [v for v in str(value).replace(",", " ").split() if v]
+        size = kind[kind.rindex("[") + 1:-1]
+        if size and len(items) != int(size):
+            raise ContractError(f"{kind} needs exactly {size} values")
+        return [coerce(inner, v) for v in items]
     text = str(value).strip()
     if kind.startswith(("uint", "int")):
         if not re.fullmatch(r"-?\d+", text):
@@ -356,3 +420,24 @@ def coerce(kind: str, value: Any) -> Any:
             raise ContractError(f"{kind} needs exactly {size} bytes")
         return raw
     raise ContractError(f"unsupported type {kind}")
+
+
+def _json_list(value: Any, kind: str) -> list:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    try:
+        parsed = json.loads(str(value))
+    except ValueError:
+        raise ContractError(f"{kind} needs a JSON list like [1, \"0x...\"]") from None
+    if not isinstance(parsed, list):
+        raise ContractError(f"{kind} needs a JSON list")
+    return parsed
+
+
+def fill_placeholders(value: Any, mapping: dict[str, Any]) -> Any:
+    """Replace "{name}" strings anywhere inside a (JSON) value."""
+    if isinstance(value, str) and value.strip() in mapping:
+        return mapping[value.strip()]
+    if isinstance(value, list):
+        return [fill_placeholders(v, mapping) for v in value]
+    return value

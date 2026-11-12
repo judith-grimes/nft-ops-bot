@@ -147,6 +147,17 @@ class Vault:
                 signers[address] = signer
             self._data, self._aes, self._signers = data, aes, signers
 
+    def verify(self, password: str) -> bool:
+        """Check a password without changing what is unlocked."""
+        data = self._read()
+        kdf = data["kdf"]
+        aes = AESGCM(_derive(password, _unb64(kdf["salt"]), kdf["n"], kdf["r"], kdf["p"]))
+        try:
+            return aes.decrypt(_unb64(data["verifier"]["nonce"]), _unb64(data["verifier"]["ct"]),
+                               b"verifier") == _VERIFIER_PLAINTEXT
+        except InvalidTag:
+            return False
+
     def lock(self) -> None:
         with self._lock:
             self._aes = None

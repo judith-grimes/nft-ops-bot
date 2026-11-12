@@ -51,6 +51,10 @@ class FakeChain:
     down_ports: set[int] = field(default_factory=set)   # simulate dead RPC endpoints
     custom: dict = field(default_factory=dict)   # address -> CustomDrop (non-SeaDrop mint contract)
     calls_by_port: dict[int, int] = field(default_factory=dict)
+    sends_by_port: dict[int, int] = field(default_factory=dict)
+    mining: bool = True                                   # False = transactions stay pending
+    pending: dict = field(default_factory=dict)           # (sender, nonce) -> tx dict
+    txs: dict = field(default_factory=dict)               # hash -> tx dict (for getTransactionByHash)
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -64,6 +68,9 @@ class FakeChain:
         if port in self.down_ports:
             raise httpx.ConnectError("connection refused", request=request)
         body = json.loads(request.content)
+        for item in body if isinstance(body, list) else [body]:
+            if item.get("method") == "eth_sendRawTransaction":
+                self.sends_by_port[port] = self.sends_by_port.get(port, 0) + 1
         if isinstance(body, list):
             out = [await self._one(item) for item in body]
         else:
@@ -82,7 +89,7 @@ class FakeChain:
         if method == "eth_chainId":
             return hex(self.chain_id)
         if method == "eth_blockNumber":
-            return "0x100"
+            return hex(0x100 + int(time.time() * 4))     # ~4 blocks per second
         if method == "eth_getBlockByNumber":
             return {"number": "0x100", "timestamp": "0x6800000", "baseFeePerGas": hex(10**9)}
         if method == "eth_maxPriorityFeePerGas":
@@ -90,18 +97,46 @@ class FakeChain:
         if method == "eth_getBalance":
             return hex(self.balances.get(params[0].lower(), 0))
         if method == "eth_getTransactionCount":
-            return hex(self.nonces.get(params[0].lower(), 0))
+            who = params[0].lower()
+            count = self.nonces.get(who, 0)
+            if params[1] == "latest":
+                count -= sum(1 for (s_, _n) in self.pending if s_ == who)
+            return hex(count)
+        if method == "eth_getTransactionByHash":
+            return self.txs.get(params[0])
         if method == "eth_sendRawTransaction":
             if self.send_delay:
                 await asyncio.sleep(self.send_delay)
             raw = bytes.fromhex(params[0][2:])
             sender = Account.recover_transaction(raw).lower()
             tx_hash = "0x" + keccak(raw).hex()
+            if tx_hash in self.receipts:
+                raise ValueError("already known")      # what real nodes answer to a re-send
             fields = rlp.decode(raw[1:])
             nonce = int.from_bytes(fields[1], "big")
             to = "0x" + fields[5].hex()
             value = int.from_bytes(fields[6], "big")
             data = bytes(fields[7])
+            tx = {"hash": tx_hash, "from": sender, "to": to, "value": hex(value), "input": "0x" + data.hex(),
+                  "nonce": hex(nonce), "gas": hex(int.from_bytes(fields[4], "big")),
+                  "maxPriorityFeePerGas": hex(int.from_bytes(fields[2], "big")),
+                  "maxFeePerGas": hex(int.from_bytes(fields[3], "big"))}
+            if not self.mining:
+                key = (sender, nonce)
+                if key in self.pending:
+                    old = self.pending[key]
+                    for fee in ("maxFeePerGas", "maxPriorityFeePerGas"):
+                        if int(tx[fee], 16) * 10 < int(old[fee], 16) * 11:
+                            raise ValueError("replacement transaction underpriced")
+                    self.txs.pop(old["hash"], None)
+                elif nonce != self.nonces.get(sender, 0):
+                    raise ValueError(f"nonce too low/high: got {nonce}, want {self.nonces.get(sender, 0)}")
+                else:
+                    self.nonces[sender] = nonce + 1
+                self.pending[key] = tx
+                self.txs[tx_hash] = tx
+                return tx_hash
+            self.txs[tx_hash] = tx
             if nonce != self.nonces.get(sender, 0):
                 raise ValueError(f"nonce too low/high: got {nonce}, want {self.nonces.get(sender, 0)}")
             if self.balances.get(sender, 0) < value:
@@ -344,6 +379,28 @@ def _mint_receipt_impl(self: FakeChain, sender: str, tx_hash: str) -> str:
 FakeChain._call = _call_impl
 FakeChain._apply = _apply_impl
 FakeChain._mint_receipt = _mint_receipt_impl
+
+
+async def _mine_impl(self: FakeChain) -> None:
+    """Include every pending transaction (only the latest one per nonce), then mine normally."""
+    pending, self.pending = sorted(self.pending.items()), {}
+    self.mining = True
+    for (sender, nonce), tx in pending:
+        self.nonces[sender] = nonce            # let the normal path accept it once
+        to, value, data = tx["to"], int(tx["value"], 16), bytes.fromhex(tx["input"][2:])
+        self.receipts.pop(tx["hash"], None)
+        ok = self._apply(sender, to, value, data)
+        gas_used = 21_000 if not data else 60_000
+        self.balances[sender] = self.balances.get(sender, 0) - (value if ok else 0) - gas_used * self.gas_price
+        self.nonces[sender] = nonce + 1
+        self.sent.append({"from": sender, "hash": tx["hash"], "to": to, "value": value, "data": data})
+        self.receipts[tx["hash"]] = {
+            "transactionHash": tx["hash"], "blockHash": "0x" + "ab" * 32, "blockNumber": "0x102",
+            "status": "0x1" if ok else "0x0", "logs": [], "gasUsed": hex(gas_used),
+            "effectiveGasPrice": hex(self.gas_price)}
+
+
+FakeChain.mine = _mine_impl
 
 
 def _sel(signature: str) -> bytes:

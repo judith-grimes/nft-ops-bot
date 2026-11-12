@@ -152,20 +152,57 @@ class RpcPool:
             "SELECT url FROM rpc_endpoints WHERE chain_id = ? AND enabled = 1 AND healthy = 1 "
             "ORDER BY latency_ms", (chain_id,))]
 
-    async def send_raw(self, chain_id: int, primary: str, raw: str) -> tuple[Any, str]:
-        """eth_sendRawTransaction on the primary, falling back only if it gave no answer.
+    async def send_raw(self, chain_id: int, primary: str, raw: str,
+                       broadcast: bool = False) -> tuple[Any, str]:
+        """eth_sendRawTransaction. Returns (result, url that accepted it).
 
-        Returns (result, url used). Identical signed bytes cannot create a second transaction.
+        Without broadcast: the primary, then the next endpoint only if it gave no answer.
+        With broadcast: every healthy endpoint at once; the first acceptance wins. Identical
+        signed bytes can never create a second transaction.
         """
         urls = [primary] + [u for u in self.healthy_urls(chain_id) if u != primary]
-        last: RpcTransportError | None = None
-        for url in urls:
-            try:
-                return await self._single(url, "eth_sendRawTransaction", [raw]), url
-            except RpcTransportError as error:
-                last = error
-        assert last is not None
-        raise last
+        if not broadcast or len(urls) == 1:
+            last: RpcTransportError | None = None
+            for url in urls:
+                try:
+                    return await self._single(url, "eth_sendRawTransaction", [raw]), url
+                except RpcTransportError as error:
+                    last = error
+            assert last is not None
+            raise last
+        tasks = {asyncio.create_task(self._single(u, "eth_sendRawTransaction", [raw])): u for u in urls}
+        rejections: dict[str, RpcError] = {}
+        transport: RpcTransportError | None = None
+        pending = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    result = task.result()
+                except RpcTransportError as error:
+                    transport = error
+                    continue
+                except RpcError as error:
+                    if "already known" in str(error).lower():
+                        for rest in pending:
+                            self._keep(rest)
+                        return None, tasks[task]
+                    rejections[tasks[task]] = error
+                    continue
+                for rest in pending:
+                    self._keep(rest)
+                return result, tasks[task]
+        if rejections:
+            raise rejections.get(primary, next(iter(rejections.values())))
+        assert transport is not None
+        raise transport
+
+    def _keep(self, task: asyncio.Task) -> None:
+        """Let a still-running broadcast finish in the background."""
+        if not hasattr(self, "_background"):
+            self._background: set[asyncio.Task] = set()
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     async def best_url(self, chain_id: int) -> str:
         """A verified, healthy endpoint for a mint job (re-checks stale health data)."""

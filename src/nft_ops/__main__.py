@@ -19,8 +19,22 @@ def main() -> int:
     parser.add_argument("--data", type=Path, default=Path("data"),
                         help="folder for the encrypted vault and database (default: ./data)")
     parser.add_argument("--no-browser", action="store_true", help="do not open the browser")
+    parser.add_argument("--restore", type=Path, metavar="BACKUP.zip",
+                        help="restore a backup into the data folder (current data is moved aside)")
     parser.add_argument("--version", action="version", version=f"nft-ops {__version__}")
     args = parser.parse_args()
+    if args.restore:
+        from .backup import BackupError, restore
+        try:
+            moved = restore(args.restore, args.data.resolve())
+        except BackupError as error:
+            print(f"\n  Restore failed: {error}\n  Nothing was changed.\n")
+            return 1
+        print(f"\n  Restored {args.restore} into {args.data.resolve()}.")
+        if moved:
+            print(f"  Your previous data was moved to {moved} (delete it once you are happy).")
+        print("  Start NFT Ops and unlock with the password the backup was made with.\n")
+        return 0
 
     state = AppState(args.data.resolve())
     app = create_app(state, args.port)

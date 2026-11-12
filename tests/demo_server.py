@@ -51,7 +51,8 @@ def main() -> None:
     delay = float(os.environ.get("DEMO_START_DELAY", "90"))
     metadata = allowlist_metadata(time.time() + delay, time.time() + 3600)
     custom = "0x4444444444444444444444444444444444444444"
-    env.chain.custom[custom] = CustomDrop(custom)          # a non-OpenSea drop, sale open
+    env.chain.custom[custom] = CustomDrop(custom, sale_start=time.time() + float(os.environ.get("DEMO_SALE_DELAY", "0")))
+    env.chain.mining = os.environ.get("DEMO_NO_MINING") != "1"   # 1 = transactions stay pending
     holder: dict = {}
     state = AppState(tmp / "data", opensea_factory=lambda: DemoOpenSea(metadata, holder["s"]),
                      pool=env.pool, gateway_factory=env.gateway_factory())

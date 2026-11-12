@@ -72,7 +72,7 @@ const BADGE = {
   ELIGIBLE: "good", NOT_ELIGIBLE: "bad", UNKNOWN: "warn", UNVERIFIED: "warn", "NOT SCANNED": "warn",
   READY: "good", confirmed: "good", active: "good", healthy: "good",
   pending: "info", submitted: "info", broadcasting: "info", waiting: "info", preparing: "info", queued: "info", running: "info", upcoming: "info",
-  failed: "bad", blocked: "bad", not_submitted: "bad", ended: "", cancelled: "warn", stopped: "warn", finished: "",
+  failed: "bad", blocked: "bad", not_submitted: "bad", ended: "", cancelled: "warn", stopped: "warn", finished: "", replaced: "", not_needed: "",
 };
 function badge(status) {
   const cls = BADGE[status] ?? (/^(INSUFFICIENT|NOT_|SOLD|PHASE|SIMULATION|LIMIT|ALLOCATION|NO_KEY|GAS|RPC)/.test(status) ? "bad"
@@ -193,6 +193,9 @@ async function startEvents() {
 function onEvent(ev) {
   if (ev.kind === "safety") setStopped(ev.stopped);
   if (ev.kind === "alert") onAlert(ev);
+  if (ev.kind === "locked") { toast(`Vault ${ev.reason}`); showLock(); }
+  if (ev.kind === "sale_open") toast("Sale is open — sending now", false);
+  if (["replace", "replace_done"].includes(ev.kind) && S.page === "history") scheduleRefresh();
   if (ev.kind === "failover") toast(`RPC did not answer — switched to a backup link (${ev.operation}).`, true);
   if (["run", "job", "mint_log"].includes(ev.kind) && ["mint", "overview"].includes(S.page)) scheduleRefresh();
   if (["txrun", "txjob"].includes(ev.kind) && ["transfers", "overview", "contracts"].includes(S.page)) scheduleRefresh();
@@ -207,6 +210,7 @@ function scheduleRefresh() {
     refreshTimer = null;
     if (S.page === "mint") await renderJobs();
     else if (S.page === "transfers" || S.page === "contracts") await renderTxJobs();
+    else if (S.page === "history") await render();
     else if (S.page === "overview") { if (S.mint.preview || $("#jobs")?.childElementCount) await renderJobs(); else await render(); }
   }, 600);
 }
@@ -494,6 +498,11 @@ async function mintSelection() {
   const e = await api(`/api/eligibility?slug=${encodeURIComponent(m.slug)}`);
   return { addresses: e.rows.filter((r) => String(r.stage_index) === String(m.stage) && r.status === "ELIGIBLE" && r.max_quantity !== 0).map((r) => r.address) };
 }
+function shortRows(rows) { return rows.filter((r) => r.shortfall && Number(r.shortfall) > 0); }
+function fundButton(rows, chainId, key) {
+  const n = new Set(shortRows(rows).map((r) => r[key])).size;
+  return n ? `<button class="primary" data-action="fund-short" data-chain="${chainId}" data-key="${key}">⚡ Fund ${n} short wallet${n === 1 ? "" : "s"}</button>` : "";
+}
 function previewHTML(p) {
   const t = p.totals, sym = symbol(p.collection.chain_id);
   p.stage.state = liveState(p.stage);
@@ -513,6 +522,7 @@ function previewHTML(p) {
       ${p.rows.map((r) => `<tr><td>${addr(r.address, r.label)}</td><td>${badge(r.eligibility)}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.reason)}</td>
         <td class="num">${r.balance ?? "—"}</td><td class="num">${esc(r.value)}</td><td class="num">${esc(r.max_gas_cost)}</td><td class="tiny">${esc(r.simulation || "—")}</td></tr>`).join("")}
     </table></div>
+    ${fundButton(p.rows, p.collection.chain_id, "address") ? `<div class="row" style="margin-top:10px">${fundButton(p.rows, p.collection.chain_id, "address")}<span class="tiny muted">Opens Distribute with each short wallet and the exact amount it is missing (+2%).</span></div>` : ""}
     ${p.token ? `<div class="row" style="margin-top:14px">
       <label>Type MINT to send ${t.ready} transaction${t.ready === 1 ? "" : "s"}<input id="m-confirm" autocomplete="off" style="width:140px"></label>
       <button class="primary" data-action="start">Start mint</button>
@@ -547,10 +557,12 @@ function historyTable(rows) {
   if (!rows.length) return `<div class="empty">No transactions yet.</div>`;
   return `<div class="table-wrap"><table>
     <tr><th>Time</th><th>Wallet</th><th>Operation</th><th>Details</th><th>Status</th><th>Transaction</th><th class="num">Value</th><th class="num">Gas</th><th>Error</th></tr>
-    ${rows.map((r) => `<tr><td class="tiny">${esc(fmtTime(r.created_at))}</td><td>${addr(r.address)}</td><td>${esc(r.operation)} #${r.job_id ?? ""}</td>
+    ${rows.map((r) => `<tr><td class="tiny">${esc(fmtTime(r.created_at))}</td><td>${addr(r.address)}</td><td>${esc(r.operation.replace("_", " "))}${r.job_id ? ` #${r.job_id}` : ""}</td>
       <td>${r.operation === "mint" ? `${esc(r.slug || "")}<div class="tiny muted">${esc(r.stage_name || "")}</div>` : `${esc(r.amount || "")} ${esc(assetName(r.asset, r.chain_id))}${r.token_id ? ` #${esc(r.token_id)}` : ""}<div class="tiny muted">→ ${esc(short(r.recipient))}</div>`}</td><td>${badge(r.status)}</td><td>${txLink(r.chain_id, r.tx_hash)}</td>
       <td class="num">${r.value_wei ? esc(weiToStr(r.value_wei)) : "—"}</td><td class="num">${r.gas_cost_wei ? esc(weiToStr(r.gas_cost_wei)) : "—"}</td>
-      <td class="wrap tiny">${esc(r.error || "")}</td></tr>`).join("")}</table></div>`;
+      <td class="wrap tiny">${esc(r.error || "")}${["submitted", "pending"].includes(r.status) && r.tx_hash && r.nonce !== null ? `
+        <div class="row" style="margin-top:4px"><button class="small" data-action="replace" data-id="${r.id}" data-mode="speedup">Speed up</button>
+        <button class="small danger" data-action="replace" data-id="${r.id}" data-mode="cancel">Cancel</button></div>` : ""}</td></tr>`).join("")}</table></div>`;
 }
 async function renderHistory() {
   const d = await api("/api/history?limit=500");
@@ -622,6 +634,12 @@ async function renderSettings() {
         <label>Wallets checked at the same time (1-10)<input name="concurrency" type="number" value="${esc(d.eligibility.concurrency)}"></label>
         <label>Pause between sign-ins (seconds)<input name="spacing_seconds" value="${esc(d.eligibility.spacing_seconds)}"></label>
         <div class="row" style="margin-top:10px"><button class="primary" type="submit">Save</button></div></form>
+      <form class="panel" id="security-form"><h2>Security &amp; backup</h2>
+        <label>Lock automatically after (minutes without activity, 0 = never)<input name="auto_lock_minutes" type="number" min="0" max="1440" value="${esc(d.security.auto_lock_minutes)}"></label>
+        <p class="tiny muted">It never locks while a mint, transfer or scan is running.</p>
+        <label style="display:flex;gap:8px;align-items:center"><input name="broadcast_all" type="checkbox" ${d.network.broadcast_all ? "checked" : ""} style="width:auto"> Send each transaction through every healthy RPC at once (faster; never creates duplicates)</label>
+        <div class="row" style="margin-top:10px"><button class="primary" type="submit">Save</button><span class="spacer"></span><button type="button" data-action="backup">Download backup</button></div>
+        <p class="tiny muted">A backup is a zip with your encrypted vault and your database. Restore it with <span class="mono">uv run --frozen nft-ops --restore file.zip</span>; it needs the same password.</p></form>
       <form class="panel" id="pw-form"><h2>Vault</h2>
         <label>Current password<input name="old" type="password" autocomplete="current-password"></label>
         <label>New password (10+ characters)<input name="new" type="password" autocomplete="new-password"></label>
@@ -633,6 +651,8 @@ async function renderSettings() {
   $("#monitor-form").onsubmit = (e) => { e.preventDefault(); guard(async () => {
     await api("/api/monitor/settings", { interval_seconds: Number(e.target.interval_seconds.value), auto_rescan: e.target.auto_rescan.checked }); toast("Monitor settings saved"); }); };
   $("#elig-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/settings", { eligibility: formData(e.target) }); toast("Saved"); }); };
+  $("#security-form").onsubmit = (e) => { e.preventDefault(); guard(async () => {
+    await api("/api/settings", { security: { auto_lock_minutes: Number(e.target.auto_lock_minutes.value) }, network: { broadcast_all: e.target.broadcast_all.checked } }); toast("Saved"); }); };
   $("#pw-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/vault/password", formData(e.target)); e.target.reset(); toast("Password changed"); }); };
 }
 
@@ -747,7 +767,8 @@ async function tabNfts(w, book) {
         : `<label>Saved list <select id="n-list"><option value="">— type below —</option>${options(book.lists, "", (l) => `${l.name} (${l.rows.length})`, (l) => l.name)}</select></label>`}
       <button class="primary" data-action="nft-preview">Preview ${n.picked.size} NFT${n.picked.size === 1 ? "" : "s"}</button>
     </div>
-    ${n.mode === "distribute" ? `<label style="margin-top:8px">Recipients — one address per line (NFTs are dealt out in order). Or CSV with <span class="mono">address,token_id</span> to give each NFT its own recipient.<textarea id="n-recipients" rows="5" spellcheck="false">${esc(n.recipients || "")}</textarea></label>` : ""}
+    ${n.mode === "distribute" ? `<label style="margin-top:8px">Recipients — one address per line (NFTs are dealt out in order). Or CSV with <span class="mono">address,token_id</span> to give each NFT its own recipient.<textarea id="n-recipients" rows="5" spellcheck="false">${esc(n.recipients || "")}</textarea></label>
+      <div class="row" style="margin-top:8px"><button class="primary" data-action="pick-recipients" data-target="n-recipients">+ Add from my wallets</button></div>` : ""}
   </div>` : ""}`;
   $("#n-col").onchange = (e) => { $("#n-contract").value = e.target.value; };
   if ($("#n-all")) $("#n-all").onchange = (e) => { d.holdings.forEach((h) => (e.target.checked ? n.picked.add(nftKey(h)) : n.picked.delete(nftKey(h)))); render(); };
@@ -812,7 +833,7 @@ async function tabDistribute(w, book) {
       <label>Max ${esc(symbol(S.chainId))} moved (optional)<input id="d-cap" value="${esc(c.cap || "")}" style="width:120px" placeholder="from Settings"></label>
     </div>
     <label style="margin-top:8px">Recipients — ${esc(help)}<textarea id="d-text" rows="7" spellcheck="false">${esc(c.text || "")}</textarea></label>
-    <div class="row" style="margin-top:10px"><button data-action="dist-check">Check list</button><button data-action="dist-save">Save list…</button>
+    <div class="row" style="margin-top:10px"><button class="primary" data-action="pick-recipients" data-target="d-text">+ Add from my wallets</button><button data-action="dist-check">Check list</button><button data-action="dist-save">Save list…</button>
       <span class="spacer"></span><button class="primary" data-action="dist-preview">Preview distribution</button></div>
     <div id="d-result"></div>
   </div>`;
@@ -856,6 +877,7 @@ function txPreviewHTML(p) {
       ${p.rows.map((r) => `<tr><td>${addr(r.source)}</td><td>${addr(r.recipient)}${r.external && p.kind !== "custom_mint" ? ` <span class="badge warn">outside</span>` : ""}</td>
         <td>${esc(r.asset)}</td><td class="num">${esc(r.amount)}</td><td class="num">${esc(r.max_gas_cost)}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.reason)}</td></tr>`).join("")}
     </table></div>
+    ${fundButton(p.rows, p.chain_id, "source") ? `<div class="row" style="margin-top:10px">${fundButton(p.rows, p.chain_id, "source")}<span class="tiny muted">Opens Distribute with each short wallet and the exact amount it is missing (+2%).</span></div>` : ""}
     ${p.token ? `<div class="row" style="margin-top:14px">
       <label>Check every row above, then type ${esc(p.confirm_word)}<input id="tx-confirm" autocomplete="off" style="width:140px"></label>
       <button class="primary" data-action="tx-start">Send ${t.ready} transaction${t.ready === 1 ? "" : "s"}</button>
@@ -952,6 +974,59 @@ Object.assign(ACTIONS_EXTRA, {
   })),
 });
 
+// ---------------------------------------------------------------- recipient picker
+// Adds addresses from your own wallets / groups / address book to a recipient box.
+const PICK = { target: "", group: "", q: "", chosen: new Set() };
+function pickerRows() {
+  const w = S.walletData ? S.walletData.wallets : [];
+  const book = (S.book && S.book.entries) || [];
+  const rows = [...w.map((x) => ({ address: x.address, label: x.label, groups: x.groups, kind: "wallet" })),
+    ...book.filter((b) => !w.some((x) => x.address === b.address)).map((b) => ({ address: b.address, label: b.label, groups: [], kind: "book" }))];
+  const q = PICK.q.toLowerCase();
+  return rows.filter((r) => (!PICK.group || (PICK.group === "__book" ? r.kind === "book" : r.groups.includes(PICK.group)))
+    && (!q || r.address.toLowerCase().includes(q) || (r.label || "").toLowerCase().includes(q)));
+}
+function pickerHTML() {
+  const rows = pickerRows();
+  const groups = (S.walletData && S.walletData.groups) || [];
+  return `<h2>Add recipients</h2>
+    <div class="row"><label>Show <select id="pk-group"><option value="">All my wallets + address book</option>
+      ${options(groups, PICK.group, (g) => `Group: ${g.name} (${g.size})`, (g) => g.name)}<option value="__book" ${PICK.group === "__book" ? "selected" : ""}>Address book only</option></select></label>
+      <label style="flex:1 1 160px">Search<input id="pk-q" value="${esc(PICK.q)}" placeholder="label or address"></label></div>
+    <div class="row"><button class="small" data-action="pick-all">Select all shown (${rows.length})</button><button class="small" data-action="pick-none">Clear</button><span class="spacer"></span><span class="muted tiny">${PICK.chosen.size} chosen</span></div>
+    <div class="table-wrap" style="max-height:340px;overflow:auto"><table>
+      ${rows.map((r) => `<tr><td><input type="checkbox" data-pick="${esc(r.address)}" ${PICK.chosen.has(r.address) ? "checked" : ""}></td>
+        <td>${esc(r.label || "")}<div class="mono tiny muted">${esc(r.address)}</div></td>
+        <td>${r.kind === "book" ? `<span class="badge">address book</span>` : r.groups.map((g) => `<span class="chip">${esc(g)}</span>`).join("")}</td></tr>`).join("") || `<tr><td class="empty">Nothing matches.</td></tr>`}
+    </table></div>
+    <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="primary" data-action="pick-add">Add ${PICK.chosen.size}</button></div>`;
+}
+function openPicker() {
+  $("#modal-card").innerHTML = pickerHTML(); $("#modal").classList.remove("hidden");
+  $("#pk-group").onchange = (e) => { PICK.group = e.target.value; openPicker(); };
+  $("#pk-q").oninput = (e) => { PICK.q = e.target.value; clearTimeout(PICK.t); PICK.t = setTimeout(() => { openPicker(); const i = $("#pk-q"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }, 250); };
+  $$("[data-pick]").forEach((cb) => (cb.onchange = (e) => { e.target.checked ? PICK.chosen.add(cb.dataset.pick) : PICK.chosen.delete(cb.dataset.pick); $("[data-action=pick-add]").textContent = `Add ${PICK.chosen.size}`; }));
+}
+Object.assign(ACTIONS_EXTRA, {
+  "pick-recipients": (el) => { PICK.target = el.dataset.target; PICK.chosen = new Set(); PICK.q = ""; openPicker(); },
+  "pick-all": () => { pickerRows().forEach((r) => PICK.chosen.add(r.address)); openPicker(); },
+  "pick-none": () => { PICK.chosen.clear(); openPicker(); },
+  "pick-add": () => {
+    const box = $(`#${PICK.target}`); if (!box) return closeModal();
+    const payer = PICK.target === "d-text" && $("#d-source") ? $("#d-source").value.toLowerCase() : "";
+    const existing = new Set(box.value.split("\n").map((l) => l.split(",")[0].trim().toLowerCase()).filter(Boolean));
+    const needsAmount = PICK.target === "d-text" && ["custom", "percent"].includes(S.tx.dist.mode);
+    const add = [...PICK.chosen].filter((a) => a.toLowerCase() !== payer && !existing.has(a.toLowerCase()));
+    const header = needsAmount && !/address/i.test(box.value.split("\n")[0] || "") ? `address,${S.tx.dist.mode === "percent" ? "percent" : "amount"}\n` : "";
+    const lines = add.map((a) => (needsAmount ? `${a},` : a));
+    box.value = (box.value.trim() ? `${box.value.trim()}\n` : header) + lines.join("\n");
+    if (PICK.target === "d-text") S.tx.dist.text = box.value; else S.tx.nft.recipients = box.value;
+    closeModal();
+    const skipped = PICK.chosen.size - add.length;
+    toast(`Added ${add.length} recipient${add.length === 1 ? "" : "s"}${skipped ? ` (${skipped} skipped: payer or already listed)` : ""}${needsAmount ? " — now type each amount after the comma" : ""}`);
+  },
+});
+
 // ---------------------------------------------------------------- contracts
 S.c = { address: "", report: null, fn: null, args: [], form: { quantity: 1, price: "", gas_limit: "", start: "", fast: false, proofs: "", source: "all", group: "" } };
 async function renderContracts() {
@@ -978,6 +1053,7 @@ async function renderContracts() {
     <div id="txjobs"></div>`;
   $("#c-chain").onchange = (e) => { S.chainId = Number(e.target.value); localStorageSet("nftops.chain", S.chainId); };
   if ($("#cm-source")) $("#cm-source").onchange = (e) => { readMintCForm(); c.form.source = e.target.value; render(); };
+  if ($("#cm-when")) $("#cm-when").onchange = (e) => { readMintCForm(); c.form.when = e.target.value; if (e.target.value !== "now" && !c.form.gas_limit) c.form.gas_limit = 200000; render(); };
   await renderTxJobs();
 }
 function reportHTML(r) {
@@ -1004,8 +1080,28 @@ function reportHTML(r) {
       <div class="table-wrap"><table>${Object.entries(r.reads).map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="mono wrap">${esc(v)}</td></tr>`).join("")}</table></div></details>` : ""}
   </div>`;
 }
+// Split "a,(b,c),d" on top-level commas only (struct parameters contain commas).
+function splitTop(text) {
+  const parts = []; let depth = 0, cur = "";
+  for (const ch of text) {
+    if (ch === "(") depth++; if (ch === ")") depth--;
+    if (ch === "," && depth === 0) { parts.push(cur); cur = ""; } else cur += ch;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+function tupleDefault(t, n) {
+  const parts = splitTop(t.slice(1, t.lastIndexOf(")")));
+  const val = (p) => p === "bytes32[]" ? "{proof}" : p.endsWith("]") ? [] : p.startsWith("uint") || p.startsWith("int") ? (/price/.test(n) ? "{price_wei}" : 0)
+    : p === "address" ? (/currency|token/.test(n) ? "{native}" : "0x0000000000000000000000000000000000000000") : p === "bool" ? false : p.startsWith("(") ? JSON.parse(tupleDefault(p, "")) : "0x";
+  return JSON.stringify(parts.map(val));
+}
 function guessArg(input, index, types) {
   const n = (input.name || "").toLowerCase(), t = input.type;
+  if (t.startsWith("(")) return tupleDefault(t, n);
+  if (t === "bytes") return "0x";
+  if (t === "address" && /currency/.test(n)) return "{native}";
+  if (t.startsWith("uint") && /price/.test(n)) return "{price_wei}";
   if (t === "bytes32[]") return "{proof}";
   if (t === "address" && (/to|recipient|minter|receiver|account|wallet/.test(n) || !n)) return "{wallet}";
   if (t.startsWith("uint") && (/qty|quantity|amount|count|num|_n$|^n$/.test(n) || types.filter((x) => x.startsWith("uint")).length === 1)) return "{quantity}";
@@ -1019,16 +1115,23 @@ function mintFormHTML(r, w) {
   if (form.source === "group" && !form.group && w.groups.length) form.group = w.groups[0].name;
   return `<div class="panel"><h2>Custom mint — <span class="mono">${esc(f.signature)}</span></h2>
     ${f.needs && f.needs.includes("signature") ? `<div class="notice bad">This function needs a signature issued by the project for each wallet. That is not supported.</div>` : ""}
-    <p class="tiny muted">Fill each input. Placeholders: <span class="mono">{quantity}</span> = quantity below, <span class="mono">{wallet}</span> = each minting wallet's own address, <span class="mono">{proof}</span> = that wallet's allowlist proof.</p>
-    <div class="row">${f.inputs.map((i, k) => `<label>${esc(i.name || `input ${k + 1}`)} <span class="mono">${esc(i.type)}</span><input data-arg="${k}" value="${esc(c.args[k] || "")}" style="width:200px"></label>`).join("") || `<span class="muted">This function takes no inputs.</span>`}</div>
+    <p class="tiny muted">Fill each input. Placeholders: <span class="mono">{quantity}</span> = quantity below, <span class="mono">{wallet}</span> = each minting wallet's own address, <span class="mono">{proof}</span> = that wallet's allowlist proof, <span class="mono">{price_wei}</span> = price per NFT in wei, <span class="mono">{native}</span> = the "native coin" address used by thirdweb-style drops. Bundled (struct) inputs are a JSON list; placeholders work inside it.</p>
+    <div class="row">${f.inputs.map((i, k) => i.type.startsWith("(") || i.type.endsWith("[]") && i.type.startsWith("(")
+      ? `<label style="flex:1 1 100%">${esc(i.name || `input ${k + 1}`)} <span class="mono">${esc(i.type)}</span><textarea data-arg="${k}" rows="2" spellcheck="false">${esc(c.args[k] || "")}</textarea></label>`
+      : `<label>${esc(i.name || `input ${k + 1}`)} <span class="mono">${esc(i.type)}</span><input data-arg="${k}" value="${esc(c.args[k] || "")}" style="width:200px"></label>`).join("") || `<span class="muted">This function takes no inputs.</span>`}</div>
     <div class="row" style="margin-top:10px">
       <label>Quantity / wallet<input id="cm-qty" type="number" min="1" value="${esc(form.quantity)}" style="width:90px"></label>
       <label>Price per NFT (${esc(symbol(r.chain_id))})<input id="cm-price" value="${esc(form.price)}" style="width:120px" placeholder="0 if free"></label>
       ${sourceControls("cm", form, w)}
     </div>
     <div class="row" style="margin-top:10px">
-      <label>Start time (optional — leave empty to send now)<input id="cm-start" type="datetime-local" step="1" value="${esc(form.start)}"></label>
-      <label>Gas limit (needed when scheduled)<input id="cm-gas" type="number" value="${esc(form.gas_limit)}" placeholder="e.g. 200000" style="width:130px"></label>
+      <label>When to send <select id="cm-when">
+        <option value="now" ${form.when === "now" || !form.when ? "selected" : ""}>Now</option>
+        <option value="time" ${form.when === "time" ? "selected" : ""}>At a set time</option>
+        <option value="open" ${form.when === "open" ? "selected" : ""}>The moment the sale opens</option></select></label>
+      ${form.when === "time" ? `<label>Start time<input id="cm-start" type="datetime-local" step="1" value="${esc(form.start)}"></label>` : ""}
+      ${form.when === "open" ? `<label>Wait at most (minutes)<input id="cm-maxwait" type="number" min="1" max="1440" value="${esc(form.maxwait || 60)}" style="width:110px"></label>` : ""}
+      <label>Gas limit (needed unless sending now)<input id="cm-gas" type="number" value="${esc(form.gas_limit)}" placeholder="e.g. 200000" style="width:130px"></label>
       <label style="display:flex;gap:6px;align-items:center"><input id="cm-fast" type="checkbox" ${form.fast ? "checked" : ""} style="width:auto"> Fast mode: skip the last-second test run</label>
       <label>Max total (${esc(symbol(r.chain_id))}, optional)<input id="cm-cap" value="${esc(form.cap || "")}" style="width:110px" placeholder="from Settings"></label>
     </div>
@@ -1043,6 +1146,7 @@ function readMintCForm() {
   form.quantity = v("#cm-qty") ?? form.quantity; form.price = v("#cm-price") ?? form.price; form.group = v("#cm-group") ?? form.group;
   form.start = v("#cm-start") ?? form.start; form.gas_limit = v("#cm-gas") ?? form.gas_limit; form.cap = v("#cm-cap") ?? form.cap;
   form.proofs = v("#cm-proofs") ?? form.proofs; if ($("#cm-fast")) form.fast = $("#cm-fast").checked;
+  form.when = v("#cm-when") ?? form.when; form.maxwait = v("#cm-maxwait") ?? form.maxwait;
 }
 Object.assign(ACTIONS_EXTRA, {
   alerts: () => guard(async () => {
@@ -1077,15 +1181,17 @@ Object.assign(ACTIONS_EXTRA, {
     const sig = $("#c-custom-fn").value.trim(); const m = /^([A-Za-z_]\w*)\((.*)\)$/.exec(sig.replace(/\s/g, ""));
     if (!m) return toast("Write it like mint(uint256)", true);
     const c = S.c; c.fn = -1; c.args = [];
-    c.fnSpec = { signature: sig.replace(/\s/g, ""), needs: m[2].includes("bytes32[]") ? "Merkle proof" : "", inputs: m[2] ? m[2].split(",").map((t) => ({ name: "", type: t })) : [] };
+    c.fnSpec = { signature: sig.replace(/\s/g, ""), needs: m[2].includes("bytes32[]") ? "Merkle proof" : "", inputs: splitTop(m[2]).map((t) => ({ name: "", type: t })) };
     render();
   },
   "cm-preview": (el) => guard(() => withBusy(el, "Test-running every wallet…", async () => {
     readMintCForm(); const c = S.c, form = c.form;
-    const start = form.start ? new Date(form.start).getTime() / 1000 : null;
+    const start = form.when === "time" && form.start ? new Date(form.start).getTime() / 1000 : null;
+    if (form.when === "time" && !start) throw new ApiError("Pick the start time.");
     const p = await api("/api/contracts/mint/preview", { chain_id: c.report.chain_id, address: c.report.address, signature: c.fnSpec.signature,
       args: c.args, quantity: Number(form.quantity), price: form.price || "0", ...sourceSelection(form), start_at: start,
-      gas_limit: Number(form.gas_limit || 0), resimulate: !form.fast, proofs: form.proofs, cap: form.cap, label: c.report.name || "" });
+      gas_limit: Number(form.gas_limit || 0), resimulate: !form.fast, proofs: form.proofs, cap: form.cap, label: c.report.name || "",
+      wait_for_open_minutes: form.when === "open" ? Number(form.maxwait || 60) : 0 });
     p.created = Date.now() / 1000; S.tx.preview = p; $("#c-preview").innerHTML = txPreviewHTML(p);
     $("#c-preview").scrollIntoView({ behavior: "smooth", block: "start" });
   })),
@@ -1163,6 +1269,45 @@ const ACTIONS = {
     <label>Type REMOVE to confirm<input id="remove-text" autocomplete="off"></label>
     <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="danger" data-action="remove-go">Remove</button></div>`),
   "remove-go": () => guard(async () => { const r = await api("/api/wallets/remove", { addresses: [...S.selected], confirm: $("#remove-text").value }); S.selected.clear(); closeModal(); toast(`Removed ${r.removed}`); render(); }),
+  "fund-short": (el) => {
+    const p = el.closest("#preview") ? S.mint.preview : S.tx.preview;
+    const key = el.dataset.key, per = {};
+    for (const r of shortRows(p.rows)) per[r[key]] = Math.max(per[r[key]] || 0, Number(r.shortfall));
+    const lines = Object.entries(per).map(([a, v]) => `${a},${(Math.ceil(v * 1.02 * 1e6) / 1e6).toFixed(6)}`);
+    S.chainId = Number(el.dataset.chain); localStorageSet("nftops.chain", S.chainId);
+    S.tx.tab = "distribute"; S.tx.preview = null;
+    S.tx.dist = { asset: "native", mode: "custom", text: `address,amount\n${lines.join("\n")}` };
+    go("transfers"); toast(`Pick the wallet that pays, then Preview distribution`);
+  },
+  replace: (el) => guard(async () => {
+    const p = await api("/api/tx/replace/preview", { history_id: Number(el.dataset.id), mode: el.dataset.mode });
+    S.replace = p;
+    modal(`<h2>${p.mode === "cancel" ? "Cancel" : "Speed up"} stuck transaction</h2>
+      <p class="muted">${p.mode === "cancel" ? "Replaces it with a 0-value transfer to yourself. If the replacement confirms first, the original never happens." : "Sends the same transaction again with higher gas. Only one of the two can confirm."}</p>
+      <div class="table-wrap"><table>
+        <tr><td>Wallet</td><td class="mono">${esc(p.address)}</td></tr><tr><td>Nonce</td><td class="mono">${p.nonce}</td></tr>
+        <tr><td>Original</td><td>${txLink(p.chain_id, p.original_hash)}</td></tr>
+        <tr><td>Max fee</td><td class="mono">${esc(p.old_max_fee_gwei)} → ${esc(p.new_max_fee_gwei)} gwei</td></tr>
+        <tr><td>Max gas cost</td><td class="mono">${esc(p.max_gas_cost)} ${esc(symbol(p.chain_id))}</td></tr></table></div>
+      ${p.problems.map((x) => `<div class="notice bad">${esc(x)}</div>`).join("")}
+      ${p.token ? `<label>Type ${esc(p.confirm_word)} to send the replacement<input id="replace-confirm" autocomplete="off"></label>` : ""}
+      <div class="row"><span class="spacer"></span><button data-action="close">Close</button>${p.token ? `<button class="primary" data-action="replace-go">Send replacement</button>` : ""}</div>`);
+  }),
+  "replace-go": (el) => guard(() => withBusy(el, "Sending…", async () => {
+    const r = await api("/api/tx/replace/send", { token: S.replace.token, confirm: $("#replace-confirm").value });
+    closeModal(); toast(`Replacement sent: ${short(r.tx_hash)}`); render();
+  })),
+  backup: () => modal(`<h2>Download backup</h2><p class="muted">Your keys stay encrypted inside it. Keep the file private and remember the password.</p>
+    <label>Vault password<input id="backup-pw" type="password" autocomplete="current-password"></label>
+    <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="primary" data-action="backup-go">Download</button></div>`),
+  "backup-go": (el) => guard(() => withBusy(el, "Preparing…", async () => {
+    const res = await fetch("/api/backup", { method: "POST", headers: { "X-Session": S.session, "Content-Type": "application/json" }, body: JSON.stringify({ password: $("#backup-pw").value }) });
+    if (!res.ok) throw new ApiError((await res.json()).error || "backup failed");
+    const name = (res.headers.get("content-disposition") || "").match(/filename="(.+)"/)?.[1] || "nft-ops-backup.zip";
+    const url = URL.createObjectURL(await res.blob());
+    const a = Object.assign(document.createElement("a"), { href: url, download: name }); document.body.append(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    closeModal(); toast(`Saved ${name}`);
+  })),
   "cc-pick": (el) => { S.mint.slug = el.dataset.slug; S.mint.stage = el.dataset.stage; S.mint.preview = null; render(); },
   "mint-selected": () => { S.mint.source = "selected"; S.mint.preview = null; go("mint"); },
   "col-refresh": (el) => guard(async () => { await api("/api/collections", { locator: el.dataset.slug }); toast("Refreshed"); render(); }),

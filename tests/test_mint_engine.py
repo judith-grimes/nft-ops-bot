@@ -70,6 +70,10 @@ def test_parallel_mint_confirms_only_ready_wallets(env):
         assert status == {wallets[0]: "READY", wallets[1]: "INSUFFICIENT_GAS",
                           wallets[2]: "NOT_ELIGIBLE"}
         assert preview["token"] and not preview["blocks"]
+        short = {r["address"]: r["shortfall"] for r in preview["rows"]}
+        worst = next(r["worst_case"] for r in preview["rows"] if r["address"] == wallets[1])
+        assert short[wallets[0]] is None
+        assert abs(float(short[wallets[1]]) - (float(worst) - PRICE / 1e18)) < 1e-12
         with pytest.raises(MintEngineError):
             await engine.start(preview["token"], "yes")      # must type MINT
         job_id = await engine.start(preview["token"], "MINT")

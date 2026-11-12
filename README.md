@@ -175,10 +175,45 @@ middle, requests switch to the next healthy link of the same network automatical
 notice. Sending the same signed transaction to a second link can never create a second
 transaction. Add a second RPC link for each network you mint on (**Networks → Add RPC URL**).
 
+## Speed tools (Stage 4)
+
+- **Send the moment the sale opens** (Contracts page → *When to send* → *The moment the sale
+  opens*): for drops with no fixed start time. One wallet's mint is test-run on every new block;
+  the instant it would succeed, every wallet sends. Set how long to wait (default 60 minutes).
+  If it never opens, or you press STOP, nothing is sent.
+- **Every RPC at once** (Settings → Security & backup, on by default): each signed transaction is
+  sent through all healthy RPC links of the network at the same time. The first one to accept it
+  wins. It cannot create duplicates; it is the same signed transaction.
+- **Speed up / Cancel** (History): a transaction stuck as *submitted* or *pending* gets two
+  buttons. *Speed up* sends the same transaction again with about 15% more gas; *Cancel* replaces
+  it with an empty transfer to yourself. Type `REPLACE` to confirm. Only one of the two can ever
+  confirm.
+- **Fund short wallets**: when a preview marks wallets as short of funds, the *Fund N short
+  wallets* button opens Distribute with each wallet and exactly what it is missing (+2%). Choose the
+  wallet that pays, preview, and type `SEND`.
+- **Add from my wallets** (Distribute and NFT distribution): pick recipients from your wallets,
+  groups or address book instead of pasting addresses.
+- **Struct inputs**: mint functions with bundled inputs (for example thirdweb's `claim`) work on
+  the Contracts page. Fill bundled inputs as a JSON list; `{wallet}`, `{quantity}`, `{proof}`,
+  `{price_wei}` and `{native}` placeholders work inside it.
+
+## Auto-lock
+
+The vault locks itself after 30 minutes without activity (change it or turn it off in Settings).
+It never locks while a mint, transfer or scan is running. Unlock with your password.
+
 ## Back up
 
-Copy the **`data`** folder (it has `vault.json` and `nft-ops.db`) somewhere safe, for example a
-USB stick, and remember your password. That is everything needed to restore your wallets.
+**Settings → Security & backup → Download backup** saves a zip with your encrypted vault and
+your database (it asks for your password first). Keep it somewhere safe, for example a USB stick,
+and remember your password. To restore it:
+
+```powershell
+uv run --frozen nft-ops --restore "E:\path\to\nft-ops-backup-....zip"
+```
+
+The backup is checked first; your current `data` folder is moved aside (not deleted) before the
+backup is unpacked. Then start NFT Ops and unlock with the password the backup was made with.
 
 ## Update to a new version
 
