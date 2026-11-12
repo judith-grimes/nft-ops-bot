@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -46,6 +47,10 @@ class FakeChain:
     erc721: dict[str, dict[int, str]] = field(default_factory=dict)     # contract -> id -> owner
     erc1155: dict[str, dict[tuple[str, int], int]] = field(default_factory=dict)
     gas_price: int = 11 * 10**8
+    supply: dict[str, tuple[int, int]] = field(default_factory=dict)  # contract -> (total, max)
+    down_ports: set[int] = field(default_factory=set)   # simulate dead RPC endpoints
+    custom: dict = field(default_factory=dict)   # address -> CustomDrop (non-SeaDrop mint contract)
+    calls_by_port: dict[int, int] = field(default_factory=dict)
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -54,6 +59,10 @@ class FakeChain:
         return httpx.AsyncClient(transport=self.transport())
 
     async def _handle(self, request: httpx.Request) -> httpx.Response:
+        port = request.url.port or 0
+        self.calls_by_port[port] = self.calls_by_port.get(port, 0) + 1
+        if port in self.down_ports:
+            raise httpx.ConnectError("connection refused", request=request)
         body = json.loads(request.content)
         if isinstance(body, list):
             out = [await self._one(item) for item in body]
@@ -101,6 +110,16 @@ class FakeChain:
             self.sent.append({"from": sender, "hash": tx_hash, "to": to, "value": value, "data": data})
             if to.lower() == OPENSEA_SEADROP_ADDRESS.lower():
                 return self._mint_receipt(sender, tx_hash)
+            if to.lower() in self.custom:
+                drop = self.custom[to.lower()]
+                problem = drop.check(sender, value, data)
+                logs = [] if problem else drop.mint(sender, data, tx_hash)
+                self.balances[sender] -= (0 if problem else value) + 120_000 * self.gas_price
+                self.receipts[tx_hash] = {
+                    "transactionHash": tx_hash, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x101",
+                    "status": "0x0" if problem else "0x1", "logs": logs, "gasUsed": hex(120_000),
+                    "effectiveGasPrice": hex(self.gas_price)}
+                return tx_hash
             ok = self._apply(sender, to, value, data)
             gas_used = 21_000 if not data else 60_000
             if ok:
@@ -125,11 +144,22 @@ class FakeChain:
                 raise ValueError("not supported by fake chain")
             if self.balances.get(sender, 0) < value:
                 raise ValueError("insufficient funds for transfer")
+            drop = self.custom.get(call["to"].lower())
+            if drop:
+                problem = drop.check(sender, value, data)
+                if problem:
+                    raise ValueError(f"execution reverted: {problem}")
+                return hex(120_000)
             if data and not self._apply(sender, call["to"].lower(), value, data, dry=True):
                 raise ValueError("execution reverted")
             return hex(21_000 if not data else 60_000)
         if method == "eth_getLogs":
             return []
+        if method == "eth_getCode":
+            drop = self.custom.get(params[0].lower())
+            return "0x" + drop.bytecode().hex() if drop else "0x"
+        if method == "eth_getStorageAt":
+            return "0x" + "00" * 32
         raise ValueError(f"unexpected method {method}")
 
 
@@ -208,6 +238,8 @@ def _u(word: bytes) -> int:
 def _call_impl(self: FakeChain, call: dict) -> str:
     to = call["to"].lower()
     data = bytes.fromhex(call.get("data", call.get("input", "0x"))[2:])
+    if to in self.custom:
+        return self.custom[to].read(data[:4].hex())
     sel, args = data[:4].hex(), data[4:]
     word = lambda n: args[32 * n: 32 * n + 32]
     if sel == "01ffc9a7":  # supportsInterface
@@ -234,6 +266,9 @@ def _call_impl(self: FakeChain, call: dict) -> str:
         return "0x" + ids[index].to_bytes(32, "big").hex()
     if sel == "00fdd58e":  # balanceOf(address,uint256)
         return "0x" + self.erc1155.get(to, {}).get((_addr(word(0)), _u(word(1))), 0).to_bytes(32, "big").hex()
+    if sel in ("18160ddd", "d5abeb01") and to in self.supply:
+        total, maximum = self.supply[to]
+        return "0x" + (total if sel == "18160ddd" else maximum).to_bytes(32, "big").hex()
     if sel == "313ce567":
         return "0x" + (6).to_bytes(32, "big").hex()
     if sel == "95d89b41":
@@ -309,3 +344,73 @@ def _mint_receipt_impl(self: FakeChain, sender: str, tx_hash: str) -> str:
 FakeChain._call = _call_impl
 FakeChain._apply = _apply_impl
 FakeChain._mint_receipt = _mint_receipt_impl
+
+
+def _sel(signature: str) -> bytes:
+    return keccak(text=signature)[:4]
+
+
+@dataclass
+class CustomDrop:
+    """A typical hand-written ERC-721 drop: public mint + Merkle-style presale."""
+
+    address: str
+    price: int = 2 * 10**15
+    max_supply: int = 100
+    sale_start: float = 0.0
+    total: int = 0
+    proofs: dict[str, str] = field(default_factory=dict)   # wallet -> valid proof hash
+
+    SIGS = ("mint(uint256)", "presaleMint(uint256,bytes32[])", "cost()", "maxSupply()",
+            "totalSupply()", "saleActive()", "name()", "supportsInterface(bytes4)")
+
+    def bytecode(self) -> bytes:
+        # Shaped like a Solidity dispatcher: PUSH4 <selector> EQ PUSH2 <dest> JUMPI ...
+        out = b"\x60\x80\x60\x40\x52"
+        for sig in self.SIGS:
+            out += b"\x63" + _sel(sig) + b"\x14\x61\x00\x10\x57"
+        return out + b"\x00"
+
+    def read(self, sel: str) -> str:
+        from eth_abi import encode as enc
+        values = {
+            _sel("cost()").hex(): enc(["uint256"], [self.price]),
+            _sel("maxSupply()").hex(): enc(["uint256"], [self.max_supply]),
+            _sel("totalSupply()").hex(): enc(["uint256"], [self.total]),
+            _sel("saleActive()").hex(): enc(["bool"], [time.time() >= self.sale_start]),
+            _sel("name()").hex(): enc(["string"], ["Custom Drop"]),
+            "01ffc9a7": enc(["bool"], [True]),
+        }
+        if sel not in values:
+            raise ValueError("execution reverted")
+        return "0x" + values[sel].hex()
+
+    def check(self, sender: str, value: int, data: bytes) -> str | None:
+        from eth_abi import decode as dec
+        sel, args = data[:4], data[4:]
+        if sel == _sel("mint(uint256)"):
+            (qty,) = dec(["uint256"], args)
+        elif sel == _sel("presaleMint(uint256,bytes32[])"):
+            qty, proof = dec(["uint256", "bytes32[]"], args)
+            if self.proofs.get(sender) not in ["0x" + p.hex() for p in proof]:
+                return "invalid proof"
+        else:
+            return "unknown function"
+        if time.time() < self.sale_start:
+            return "sale not active"
+        if value != self.price * qty:
+            return "wrong payment"
+        if self.total + qty > self.max_supply:
+            return "sold out"
+        return None
+
+    def mint(self, sender: str, data: bytes, tx_hash: str) -> list[dict]:
+        from eth_abi import decode as dec
+        (qty,) = dec(["uint256"], data[4:36])
+        logs = []
+        for _ in range(qty):
+            self.total += 1
+            logs.append({"address": self.address, "data": "0x", "topics": [
+                "0x" + TRANSFER.hex(), "0x" + "00" * 32, "0x" + "00" * 12 + sender[2:],
+                "0x" + self.total.to_bytes(32, "big").hex()], "transactionHash": tx_hash})
+        return logs

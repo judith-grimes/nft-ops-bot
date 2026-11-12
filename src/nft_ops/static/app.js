@@ -13,7 +13,7 @@ const S = {
         dist: { asset: "native", mode: "equal_each" } },
   stopped: false,
 };
-const PAGES = ["overview", "wallets", "collections", "eligibility", "mint", "transfers", "history", "networks", "settings"];
+const PAGES = ["overview", "wallets", "collections", "eligibility", "mint", "transfers", "contracts", "history", "networks", "settings"];
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -146,6 +146,7 @@ $("#lock-form").addEventListener("submit", async (e) => {
 function showApp() {
   $("#lock").classList.add("hidden"); $("#app").classList.remove("hidden");
   setStopped(S.stopped); startEvents(); go(PAGES.includes(S.page) ? S.page : "overview");
+  api("/api/alerts").then((a) => setBell(a.unread)).catch(() => {});
 }
 
 // ---------------------------------------------------------------- STOP
@@ -190,8 +191,10 @@ async function startEvents() {
 }
 function onEvent(ev) {
   if (ev.kind === "safety") setStopped(ev.stopped);
+  if (ev.kind === "alert") onAlert(ev);
+  if (ev.kind === "failover") toast(`RPC did not answer — switched to a backup link (${ev.operation}).`, true);
   if (["run", "job", "mint_log"].includes(ev.kind) && ["mint", "overview"].includes(S.page)) scheduleRefresh();
-  if (["txrun", "txjob"].includes(ev.kind) && ["transfers", "overview"].includes(S.page)) scheduleRefresh();
+  if (["txrun", "txjob"].includes(ev.kind) && ["transfers", "overview", "contracts"].includes(S.page)) scheduleRefresh();
   if (ev.kind === "eligibility" && S.page === "eligibility") {
     const bar = $("#scan-bar"); if (bar) { bar.style.width = `${(100 * ev.done) / ev.total}%`; $("#scan-text").textContent = `${ev.done} / ${ev.total} wallets checked`; }
   }
@@ -202,7 +205,7 @@ function scheduleRefresh() {
   refreshTimer = setTimeout(async () => {
     refreshTimer = null;
     if (S.page === "mint") await renderJobs();
-    else if (S.page === "transfers") await renderTxJobs();
+    else if (S.page === "transfers" || S.page === "contracts") await renderTxJobs();
     else if (S.page === "overview") await render();
   }, 600);
 }
@@ -238,7 +241,11 @@ async function renderOverview() {
         : `<div class="empty">No upcoming phases. Add a collection.</div>`}</div>
       <div class="panel"><h2>Active operations</h2>${d.active_jobs.length || d.active_tx_jobs.length ? d.active_jobs.map(jobCard).join("") + d.active_tx_jobs.map(txJobCard).join("") : `<div class="empty">Nothing running.</div>`}</div>
     </div>
+    <div class="panel"><div class="row"><h2 style="margin:0">Alerts</h2><span class="spacer"></span><button class="small" data-action="alerts">All alerts</button></div>
+      <div id="overview-alerts" style="margin-top:8px"></div></div>
     <div class="panel"><h2>Recent transactions</h2>${historyTable(d.recent)}</div>`;
+  const a = await api("/api/alerts"); setBell(a.unread);
+  $("#overview-alerts").innerHTML = a.alerts.length ? alertsHTML(a.alerts.slice(0, 6)) : `<div class="empty">No alerts yet. Watched collections report phase openings, changes and sell-outs here.</div>`;
 }
 
 // ---------------------------------------------------------------- wallets
@@ -314,8 +321,9 @@ async function renderCollections() {
       <div class="row"><div><h2 style="margin:0">${esc(c.slug)}</h2>
         <div class="tiny muted">${esc(c.chain_name)} · ${addr(c.address)} · <a href="${esc(c.opensea_url)}" target="_blank" rel="noopener">OpenSea</a>
         ${c.minted_out ? ' · <span class="badge bad">minted out</span>' : ""}${c.disabled ? ' · <span class="badge bad">disabled</span>' : ""}
-        · updated ${esc(fmtTime(c.updated_at))}</div></div><span class="spacer"></span>
-        <button class="small" data-action="col-refresh" data-slug="${esc(c.slug)}">Refresh</button>
+        · checked ${esc(fmtTime(c.checked_at || c.updated_at))}${c.supply ? ` · minted ${c.supply.total}${c.supply.max ? ` / ${c.supply.max}` : ""}` : ""}</div></div><span class="spacer"></span>
+        <button class="small ${c.watch ? "primary" : ""}" data-action="col-watch" data-slug="${esc(c.slug)}" data-watch="${c.watch ? 0 : 1}" title="Alerts for phase openings, changes and sell-outs">${c.watch ? "Watching ✓" : "Watch"}</button>
+        <button class="small" data-action="col-check" data-slug="${esc(c.slug)}">Check now</button>
         <button class="small" data-action="col-elig" data-slug="${esc(c.slug)}">Eligibility</button>
         <button class="small primary" data-action="col-mint" data-slug="${esc(c.slug)}">Mint</button>
         <button class="small danger" data-action="col-delete" data-slug="${esc(c.slug)}">Remove</button></div>
@@ -554,6 +562,13 @@ async function renderSettings() {
         <label>Wallets preparing at the same time (OpenSea sign-ins)<input name="setup_concurrency" type="number" value="${esc(d.mint.setup_concurrency)}"></label>
         <label>Receipt wait before marking pending (seconds)<input name="pending_timeout_seconds" type="number" value="${esc(d.mint.pending_timeout_seconds)}"></label>
         <div class="row" style="margin-top:10px"><button class="primary" type="submit">Save mint defaults</button></div></form>
+      <form class="panel" id="monitor-form"><h2>Collection monitor</h2>
+        <p class="tiny muted">Watched collections are re-checked on this schedule, every 10 s in the last 10 minutes before a phase, and right when it opens. The monitor never sends transactions.</p>
+        <label>Check every (seconds, 20-3600)<input name="interval_seconds" type="number" value="${esc(d.monitor.interval_seconds)}"></label>
+        <label style="display:flex;gap:8px;align-items:center"><input name="auto_rescan" type="checkbox" ${d.monitor.auto_rescan ? "checked" : ""} style="width:auto"> Re-check eligibility automatically when a phase opens</label>
+        <div class="row" style="margin-top:10px"><button class="primary" type="submit">Save</button>
+          <button type="button" data-action="notify-on">${localStorageGet("nftops.notify") === "1" ? "Desktop alerts: on" : "Turn on desktop alerts"}</button>
+          <button type="button" data-action="sound-toggle">${localStorageGet("nftops.sound") === "1" ? "Sound: on" : "Sound: off"}</button></div></form>
       <form class="panel" id="elig-form"><h2>Eligibility scan pacing</h2>
         <p class="tiny muted">Lower values are gentler on OpenSea and avoid rate limits.</p>
         <label>Wallets checked at the same time (1-10)<input name="concurrency" type="number" value="${esc(d.eligibility.concurrency)}"></label>
@@ -567,11 +582,39 @@ async function renderSettings() {
   const formData = (f) => Object.fromEntries(new FormData(f).entries());
   $("#limits-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/settings", { limits: formData(e.target) }); toast("Limits saved"); }); };
   $("#mint-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/settings", { mint: formData(e.target) }); S.mint.form = null; toast("Mint defaults saved"); }); };
+  $("#monitor-form").onsubmit = (e) => { e.preventDefault(); guard(async () => {
+    await api("/api/monitor/settings", { interval_seconds: Number(e.target.interval_seconds.value), auto_rescan: e.target.auto_rescan.checked }); toast("Monitor settings saved"); }); };
   $("#elig-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/settings", { eligibility: formData(e.target) }); toast("Saved"); }); };
   $("#pw-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/vault/password", formData(e.target)); e.target.reset(); toast("Password changed"); }); };
 }
 
 const ACTIONS_EXTRA = {};
+
+
+// ---------------------------------------------------------------- alerts
+function setBell(n) { const c = $("#bell-count"); c.textContent = n; c.classList.toggle("hidden", !n); }
+function alertsHTML(rows) {
+  return rows.map((a) => `<div class="alert-row ${a.read ? "" : "unread"}"><span class="dot ${esc(a.level)}"></span>
+    <div><div class="msg">${esc(a.message)}</div><div class="tiny muted">${esc(fmtTime(a.created_at))}</div></div></div>`).join("");
+}
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = 880; g.gain.value = 0.08; o.connect(g); g.connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.18);
+  } catch { /* no audio */ }
+}
+function onAlert(ev) {
+  setBell(Number($("#bell-count").textContent || 0) + 1);
+  toast(ev.message, ev.level === "warn");
+  if (localStorageGet("nftops.sound") === "1") beep();
+  if (localStorageGet("nftops.notify") === "1" && "Notification" in window && Notification.permission === "granted") {
+    try { new Notification("NFT Ops", { body: ev.message, icon: "/static/icon.svg" }); } catch { /* ignore */ }
+  }
+  if (S.page === "overview") scheduleRefresh();
+}
+$("#bell").addEventListener("click", () => ACTIONS_EXTRA.alerts());
 
 // ---------------------------------------------------------------- transfers
 function assetName(asset, chainId) {
@@ -743,15 +786,15 @@ function txPreviewHTML(p) {
     <div class="row"><h2 style="margin:0">Preview — ${esc(p.title)}</h2><span class="spacer"></span><span class="muted">max fee ${esc(p.fees.max_fee_gwei)} gwei</span></div>
     <div class="grid cards" style="margin:12px 0">
       <div class="card"><div class="muted">Ready</div><div class="big">${t.ready} / ${t.total}</div><div class="tiny muted">${t.wallets} sending wallet${t.wallets === 1 ? "" : "s"}</div></div>
-      <div class="card"><div class="muted">${esc(sym)} moved</div><div class="big">${esc(t.native_moved)}</div><div class="tiny muted">limit ${esc(t.move_cap)}</div></div>
+      <div class="card"><div class="muted">${p.kind === "custom_mint" ? "Mint total" : `${esc(sym)} moved`}</div><div class="big">${esc(t.native_moved)}</div><div class="tiny muted">limit ${esc(t.move_cap)}${p.scheduled_at ? ` · sends in ${countdown(p.scheduled_at)}` : ""}</div></div>
       <div class="card"><div class="muted">Max gas</div><div class="big">${esc(t.max_gas)}</div><div class="tiny muted">${esc(sym)}, usually much less</div></div>
-      <div class="card"><div class="muted">Leaves your wallets</div><div class="big">${esc(t.external_spend)}</div><div class="tiny muted">${t.external_recipients} outside recipient${t.external_recipients === 1 ? "" : "s"} · 24h ${esc(t.daily_used)}/${esc(t.daily_limit)}</div></div>
+      <div class="card"><div class="muted">Leaves your wallets</div><div class="big">${esc(t.external_spend)}</div><div class="tiny muted">${p.kind === "custom_mint" ? "paid to the NFT contract" : `${t.external_recipients} outside recipient${t.external_recipients === 1 ? "" : "s"}`} · 24h ${esc(t.daily_used)}/${esc(t.daily_limit)}</div></div>
     </div>
     ${p.blocks.map((b) => `<div class="notice bad">${esc(b)}</div>`).join("")}
     ${p.notes.map((n) => `<div class="notice info">${esc(n)}</div>`).join("")}
     <div class="table-wrap"><table>
-      <tr><th>From</th><th>To</th><th>Asset</th><th class="num">Amount</th><th class="num">Max gas</th><th>Status</th><th>Reason</th></tr>
-      ${p.rows.map((r) => `<tr><td>${addr(r.source)}</td><td>${addr(r.recipient)}${r.external ? ` <span class="badge warn">outside</span>` : ""}</td>
+      <tr><th>From</th><th>${p.kind === "custom_mint" ? "NFTs go to" : "To"}</th><th>Asset</th><th class="num">Amount</th><th class="num">Max gas</th><th>Status</th><th>Reason</th></tr>
+      ${p.rows.map((r) => `<tr><td>${addr(r.source)}</td><td>${addr(r.recipient)}${r.external && p.kind !== "custom_mint" ? ` <span class="badge warn">outside</span>` : ""}</td>
         <td>${esc(r.asset)}</td><td class="num">${esc(r.amount)}</td><td class="num">${esc(r.max_gas_cost)}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.reason)}</td></tr>`).join("")}
     </table></div>
     ${p.token ? `<div class="row" style="margin-top:14px">
@@ -845,11 +888,151 @@ Object.assign(ACTIONS_EXTRA, {
   "list-delete": (el) => guard(async () => { if (!confirm(`Delete list “${el.dataset.name}”?`)) return; await api("/api/addressbook", { action: "delete_list", name: el.dataset.name }); render(); }),
   "tx-start": (el) => guard(() => withBusy(el, "Sending…", async () => {
     const r = await api("/api/tx/start", { token: S.tx.preview.token, confirm: $("#tx-confirm").value });
-    S.tx.preview = null; $("#tx-preview").innerHTML = ""; toast(`Operation #${r.job_id} started`); renderTxJobs();
+    S.tx.preview = null; ["#tx-preview", "#c-preview"].forEach((id) => { if ($(id)) $(id).innerHTML = ""; });
+    toast(`Operation #${r.job_id} started`); renderTxJobs();
   })),
 });
 
-const PAGE_RENDER = { overview: renderOverview, wallets: renderWallets, collections: renderCollections, eligibility: renderEligibility, mint: renderMint, transfers: renderTransfers, history: renderHistory, networks: renderNetworks, settings: renderSettings };
+// ---------------------------------------------------------------- contracts
+S.c = { address: "", report: null, fn: null, args: [], form: { quantity: 1, price: "", gas_limit: "", start: "", fast: false, proofs: "", source: "all", group: "" } };
+async function renderContracts() {
+  const c = S.c;
+  const [w, list] = await Promise.all([api(`/api/wallets?chain_id=${S.chainId}`), api("/api/contracts")]);
+  S.walletData = w;
+  const r = c.report;
+  $("#main").innerHTML = `
+    <div class="page-head"><h1>Contracts</h1></div>
+    <div class="panel">
+      <p class="muted">For mints that are not OpenSea drops. Paste the NFT contract: the analyser reads it and lists how to mint, the price, supply and restrictions. Nothing is sent until you preview and type MINT.</p>
+      <div class="row">
+        <label>Network ${chainSelect("c-chain", S.chainId)}</label>
+        <label style="flex:1 1 360px">Contract address<input id="c-address" class="mono" value="${esc(c.address)}" placeholder="0x…"></label>
+        <button class="primary" data-action="c-analyze">Analyse</button>
+      </div>
+      <details style="margin-top:8px"><summary class="tiny">Paste the ABI (optional — for unverified contracts, gives an exact report)</summary>
+        <textarea id="c-abi" rows="5" spellcheck="false" placeholder='[{"type":"function","name":"mint",...}]'></textarea></details>
+      ${list.reports.length ? `<div class="chips">${list.reports.slice(0, 8).map((x) => `<button class="small" data-action="c-load" data-address="${esc(x.address)}" data-chain="${x.chain_id}">${esc(x.name || short(x.address))}</button>`).join("")}</div>` : ""}
+    </div>
+    ${r ? reportHTML(r) : ""}
+    ${r && c.fnSpec ? mintFormHTML(r, w) : ""}
+    <div id="c-preview">${S.tx.preview && S.tx.preview.kind === "custom_mint" ? txPreviewHTML(S.tx.preview) : ""}</div>
+    <div id="txjobs"></div>`;
+  $("#c-chain").onchange = (e) => { S.chainId = Number(e.target.value); localStorageSet("nftops.chain", S.chainId); };
+  if ($("#cm-source")) $("#cm-source").onchange = (e) => { readMintCForm(); c.form.source = e.target.value; render(); };
+  await renderTxJobs();
+}
+function reportHTML(r) {
+  const supply = r.reads["totalSupply()"] ? `${r.reads["totalSupply()"]}${r.reads["maxSupply()"] || r.reads["MAX_SUPPLY()"] ? ` / ${r.reads["maxSupply()"] || r.reads["MAX_SUPPLY()"]}` : ""}` : "—";
+  return `<div class="panel">
+    <div class="row"><h2 style="margin:0">${esc(r.name || "Contract")} ${r.symbol ? `<span class="muted">(${esc(r.symbol)})</span>` : ""}</h2><span class="spacer"></span>
+      <span class="badge ${r.confidence === "high" ? "good" : r.confidence === "medium" ? "warn" : "bad"}">${esc(r.confidence)} confidence</span></div>
+    <div class="tiny muted">${addr(r.address)} · ${esc(network(r.chain_id)?.name || r.chain_id)}${r.implementation ? ` · proxy → ${esc(short(r.implementation))}` : ""}</div>
+    <div class="grid cards" style="margin:12px 0">
+      <div class="card"><div class="muted">Standard</div><div class="big">${esc(r.standard.toUpperCase())}</div></div>
+      <div class="card"><div class="muted">Source</div><div class="big" style="font-size:15px">${esc(r.abi_source)}</div><div class="tiny muted">${r.verified ? "verified" : "not verified"}</div></div>
+      <div class="card"><div class="muted">Price read from contract</div><div class="big">${r.price_wei ? `${esc(weiToStr(r.price_wei))} ${esc(symbol(r.chain_id))}` : "—"}</div></div>
+      <div class="card"><div class="muted">Minted / max</div><div class="big">${esc(supply)}</div></div>
+    </div>
+    ${r.restrictions.map((x) => `<div class="notice warn">${esc(x)}</div>`).join("")}
+    ${r.notes.map((x) => `<div class="notice info">${esc(x)}</div>`).join("")}
+    <h3 style="margin-top:12px">Mint functions found</h3>
+    ${r.mint_functions.length ? `<div class="table-wrap"><table><tr><th>Function</th><th>Payable</th><th>Needs</th><th>Found by</th><th></th></tr>
+      ${r.mint_functions.map((f, i) => `<tr><td class="mono">${esc(f.signature)}</td><td>${esc(f.mutability)}</td><td class="wrap">${esc(f.needs || "—")}</td>
+        <td class="tiny">${esc(f.source)} (${esc(f.confidence)})</td><td><button class="small ${S.c.fn === i ? "primary" : ""}" data-action="c-use" data-index="${i}">Use</button></td></tr>`).join("")}</table></div>`
+      : `<div class="empty">No mint function recognised. Paste the ABI, or type the function yourself below.</div>`}
+    <div class="row" style="margin-top:10px"><label style="flex:1 1 300px">Or type a function<input id="c-custom-fn" class="mono" placeholder="mint(uint256)"></label><button data-action="c-use-custom">Use</button></div>
+    ${Object.keys(r.reads).length ? `<details style="margin-top:10px"><summary class="tiny">All values read from the contract (${Object.keys(r.reads).length})</summary>
+      <div class="table-wrap"><table>${Object.entries(r.reads).map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="mono wrap">${esc(v)}</td></tr>`).join("")}</table></div></details>` : ""}
+  </div>`;
+}
+function guessArg(input, index, types) {
+  const n = (input.name || "").toLowerCase(), t = input.type;
+  if (t === "bytes32[]") return "{proof}";
+  if (t === "address" && (/to|recipient|minter|receiver|account|wallet/.test(n) || !n)) return "{wallet}";
+  if (t.startsWith("uint") && (/qty|quantity|amount|count|num|_n$|^n$/.test(n) || types.filter((x) => x.startsWith("uint")).length === 1)) return "{quantity}";
+  return "";
+}
+function mintFormHTML(r, w) {
+  const c = S.c, f = c.fnSpec, form = c.form;
+  if (!c.args.length && f.inputs.length) c.args = f.inputs.map((i, k) => guessArg(i, k, f.inputs.map((x) => x.type)));
+  const usesProof = c.args.includes("{proof}");
+  if (!form.price && r.price_wei) form.price = weiToStr(r.price_wei);
+  if (form.source === "group" && !form.group && w.groups.length) form.group = w.groups[0].name;
+  return `<div class="panel"><h2>Custom mint — <span class="mono">${esc(f.signature)}</span></h2>
+    ${f.needs && f.needs.includes("signature") ? `<div class="notice bad">This function needs a signature issued by the project for each wallet. That is not supported.</div>` : ""}
+    <p class="tiny muted">Fill each input. Placeholders: <span class="mono">{quantity}</span> = quantity below, <span class="mono">{wallet}</span> = each minting wallet's own address, <span class="mono">{proof}</span> = that wallet's allowlist proof.</p>
+    <div class="row">${f.inputs.map((i, k) => `<label>${esc(i.name || `input ${k + 1}`)} <span class="mono">${esc(i.type)}</span><input data-arg="${k}" value="${esc(c.args[k] || "")}" style="width:200px"></label>`).join("") || `<span class="muted">This function takes no inputs.</span>`}</div>
+    <div class="row" style="margin-top:10px">
+      <label>Quantity / wallet<input id="cm-qty" type="number" min="1" value="${esc(form.quantity)}" style="width:90px"></label>
+      <label>Price per NFT (${esc(symbol(r.chain_id))})<input id="cm-price" value="${esc(form.price)}" style="width:120px" placeholder="0 if free"></label>
+      ${sourceControls("cm", form, w)}
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>Start time (optional — leave empty to send now)<input id="cm-start" type="datetime-local" step="1" value="${esc(form.start)}"></label>
+      <label>Gas limit (needed when scheduled)<input id="cm-gas" type="number" value="${esc(form.gas_limit)}" placeholder="e.g. 200000" style="width:130px"></label>
+      <label style="display:flex;gap:6px;align-items:center"><input id="cm-fast" type="checkbox" ${form.fast ? "checked" : ""} style="width:auto"> Fast mode: skip the last-second test run</label>
+      <label>Max total (${esc(symbol(r.chain_id))}, optional)<input id="cm-cap" value="${esc(form.cap || "")}" style="width:110px" placeholder="from Settings"></label>
+    </div>
+    ${usesProof ? `<label style="margin-top:8px">Allowlist proofs — JSON <span class="mono">{"0xWallet": ["0x…", …]}</span> or lines <span class="mono">0xWallet, 0xproof1 0xproof2</span><textarea id="cm-proofs" rows="5" spellcheck="false">${esc(form.proofs)}</textarea></label>` : ""}
+    <p class="tiny muted">Each wallet is test-run on-chain in the preview. For a scheduled start, wallets wait, refresh 3 s before, re-run the test at the start time and only send if it passes (unless fast mode is on).</p>
+    <div class="row"><span class="spacer"></span><button class="primary" data-action="cm-preview">Preview mint</button></div>
+  </div>`;
+}
+function readMintCForm() {
+  const c = S.c, form = c.form, v = (id) => ($(id) ? $(id).value : undefined);
+  $$("[data-arg]").forEach((i) => { c.args[Number(i.dataset.arg)] = i.value; });
+  form.quantity = v("#cm-qty") ?? form.quantity; form.price = v("#cm-price") ?? form.price; form.group = v("#cm-group") ?? form.group;
+  form.start = v("#cm-start") ?? form.start; form.gas_limit = v("#cm-gas") ?? form.gas_limit; form.cap = v("#cm-cap") ?? form.cap;
+  form.proofs = v("#cm-proofs") ?? form.proofs; if ($("#cm-fast")) form.fast = $("#cm-fast").checked;
+}
+Object.assign(ACTIONS_EXTRA, {
+  alerts: () => guard(async () => {
+    const a = await api("/api/alerts");
+    modal(`<div class="row"><h2 style="margin:0">Alerts</h2><span class="spacer"></span><button class="small" data-action="alerts-read">Mark all read</button><button class="small" data-action="close">Close</button></div>
+      <div>${a.alerts.length ? alertsHTML(a.alerts) : `<div class="empty">No alerts yet.</div>`}</div>`);
+  }),
+  "alerts-read": () => guard(async () => { await api("/api/alerts/read", {}); setBell(0); closeModal(); if (S.page === "overview") render(); }),
+  "col-watch": (el) => guard(async () => { await api("/api/collections/watch", { slug: el.dataset.slug, watch: el.dataset.watch === "1" }); render(); }),
+  "col-check": (el) => guard(() => withBusy(el, "Checking…", async () => { await api("/api/collections/check", { slug: el.dataset.slug }); toast("Checked"); render(); })),
+  "notify-on": (el) => {
+    if (!("Notification" in window)) return toast("This browser does not support desktop notifications", true);
+    if (localStorageGet("nftops.notify") === "1") { localStorageSet("nftops.notify", "0"); el.textContent = "Turn on desktop alerts"; return; }
+    Notification.requestPermission().then((p) => {
+      if (p === "granted") { localStorageSet("nftops.notify", "1"); el.textContent = "Desktop alerts: on"; new Notification("NFT Ops", { body: "Desktop alerts are on." }); }
+      else toast("Notifications were blocked in the browser settings", true);
+    });
+  },
+  "sound-toggle": (el) => { const on = localStorageGet("nftops.sound") !== "1"; localStorageSet("nftops.sound", on ? "1" : "0"); el.textContent = on ? "Sound: on" : "Sound: off"; if (on) beep(); },
+  "c-analyze": (el) => guard(() => withBusy(el, "Reading contract…", async () => {
+    const c = S.c; c.address = $("#c-address").value.trim(); S.chainId = Number($("#c-chain").value);
+    const res = await api("/api/contracts/analyze", { chain_id: S.chainId, address: c.address, abi: $("#c-abi").value });
+    c.report = res.report; c.fn = null; c.fnSpec = null; c.args = []; S.tx.preview = null; render();
+  })),
+  "c-load": (el) => guard(async () => {
+    const c = S.c; c.address = el.dataset.address; S.chainId = Number(el.dataset.chain);
+    c.report = (await api("/api/contracts")).reports.find((x) => x.address === el.dataset.address && x.chain_id === S.chainId);
+    c.fn = null; c.fnSpec = null; c.args = []; render();
+  }),
+  "c-use": (el) => { const c = S.c; c.fn = Number(el.dataset.index); c.fnSpec = c.report.mint_functions[c.fn]; c.args = []; S.tx.preview = null; render(); },
+  "c-use-custom": () => {
+    const sig = $("#c-custom-fn").value.trim(); const m = /^([A-Za-z_]\w*)\((.*)\)$/.exec(sig.replace(/\s/g, ""));
+    if (!m) return toast("Write it like mint(uint256)", true);
+    const c = S.c; c.fn = -1; c.args = [];
+    c.fnSpec = { signature: sig.replace(/\s/g, ""), needs: m[2].includes("bytes32[]") ? "Merkle proof" : "", inputs: m[2] ? m[2].split(",").map((t) => ({ name: "", type: t })) : [] };
+    render();
+  },
+  "cm-preview": (el) => guard(() => withBusy(el, "Test-running every wallet…", async () => {
+    readMintCForm(); const c = S.c, form = c.form;
+    const start = form.start ? new Date(form.start).getTime() / 1000 : null;
+    const p = await api("/api/contracts/mint/preview", { chain_id: c.report.chain_id, address: c.report.address, signature: c.fnSpec.signature,
+      args: c.args, quantity: Number(form.quantity), price: form.price || "0", ...sourceSelection(form), start_at: start,
+      gas_limit: Number(form.gas_limit || 0), resimulate: !form.fast, proofs: form.proofs, cap: form.cap, label: c.report.name || "" });
+    p.created = Date.now() / 1000; S.tx.preview = p; $("#c-preview").innerHTML = txPreviewHTML(p);
+    $("#c-preview").scrollIntoView({ behavior: "smooth", block: "start" });
+  })),
+});
+
+const PAGE_RENDER = { overview: renderOverview, wallets: renderWallets, collections: renderCollections, eligibility: renderEligibility, mint: renderMint, transfers: renderTransfers, contracts: renderContracts, history: renderHistory, networks: renderNetworks, settings: renderSettings };
 
 // ---------------------------------------------------------------- actions
 const ACTIONS = {

@@ -125,10 +125,16 @@ def describe(metadata: CollectionMetadata, now: int | None = None) -> dict:
 
 def list_all(db: Database) -> list[dict]:
     out = []
-    for row in db.all("SELECT slug, data, chain_name, updated_at FROM collections ORDER BY slug"):
+    for row in db.all("SELECT slug, data, chain_name, updated_at, watch, snapshot, next_check "
+                      "FROM collections ORDER BY slug"):
         info = describe(from_json(row["data"]))
         info["chain_name"] = row["chain_name"]
         info["updated_at"] = row["updated_at"]
+        info["watch"] = bool(row["watch"])
+        snap = json.loads(row["snapshot"]) if row["snapshot"] else {}
+        info["supply"] = snap.get("supply")
+        info["checked_at"] = snap.get("checked_at")
+        info["next_check"] = row["next_check"]
         counts = db.all("SELECT stage_index, COUNT(*) AS n FROM eligibility WHERE slug = ? AND "
                         "status = 'ELIGIBLE' GROUP BY stage_index", (row["slug"],))
         eligible = {c["stage_index"]: c["n"] for c in counts}

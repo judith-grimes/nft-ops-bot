@@ -17,13 +17,16 @@ checked by a test so nobody can quietly change it. See [VENDORED.md](VENDORED.md
 | --- | --- |
 | **Overview** | Wallet count, balances per network, eligible wallets, upcoming phases with countdowns, running operations, recent transactions. |
 | **Wallets** | Import keys, generate new wallets, add watch-only addresses, labels, groups, balances (native coin, ERC-20 tokens, NFTs held), CSV import/export (addresses only). |
-| **Collections** | Add an OpenSea drop by link, slug or contract. See every phase, its times, price, per-wallet limit and how many of your wallets are eligible. |
+| **Collections** | Add an OpenSea drop by link, slug or contract. See every phase, its times, price, per-wallet limit, how many of your wallets are eligible and how many NFTs are minted. **Watch** a collection to get alerts. |
 | **Eligibility** | Scan all wallets (or a group). Each wallet signs in to OpenSea and gets OpenSea's own answer. Filter by status, export CSV. |
 | **Mint** | Pick a phase and wallets, preview every wallet (eligibility, balance, gas, allocation, limits; public phases are simulated on-chain), type `MINT`, and all ready wallets mint in parallel with live status. |
 | **Transfers** | **NFTs:** find your NFTs (ERC-721 and ERC-1155) and consolidate them into one wallet or distribute them to many. **Sweep:** collect ETH or a token from many wallets into one, keeping a gas reserve in each. **Distribute:** send ETH or a token to many addresses: same amount each, split a total equally or by percent, custom amounts, or many-to-many from a CSV. **Address book:** approved outside destinations and saved recipient lists. |
+| **Contracts** | For mints that are **not** OpenSea drops: paste a contract and get a report (mint functions, price, supply, sale state, allowlist needs, confidence). Then mint with any of your wallets: every wallet is test-run first, can be scheduled for an exact start time, and the result is proven by the NFTs arriving. |
 | **History** | Every mint and transfer with its transaction hash, amount, recipient, cost and result. CSV export. |
 | **Networks** | Several RPC links per chain, with health, speed and automatic fallback. Built in: Robinhood Chain (default), Ethereum, Base, HyperEVM, Monad, Plasma, Arc, XRPL EVM and Elysium (Kinetiq) switched on; Arbitrum, Optimism, Polygon, ApeChain and Elysium (Vulcan Forged) ready to switch on. Any other EVM chain can be added. |
 | **Settings** | Spending limits, mint defaults, scan speed, vault password, lock. |
+
+The 🔔 bell shows alerts from watched collections: a phase opening soon, a phase opening (with how many of your wallets are eligible and funded), a closed phase, price, limit or time changes, and sell-outs. Turn on desktop alerts and sound in **Settings → Collection monitor**. The monitor never sends anything by itself.
 
 The red **STOP** button is on every page. It stops anything that has not been sent yet,
 immediately, and stays on (even after a restart) until you type `RESUME`.
@@ -148,6 +151,30 @@ Choose the network at the top right first. Every tab ends in a **Preview**: chec
 The **maximum native coin moved by one sweep or distribution** limit (Settings, default 1 ETH)
 stops large moves by mistake. Raise it when you mean to move more.
 
+## Mints that are not OpenSea drops (Contracts page)
+
+1. Choose the network, paste the NFT contract address → **Analyse**.
+2. Read the report. **High** confidence means verified source code was found; **medium** means
+   the mint functions were recognised from the deployed code by their signatures. If you have the
+   contract's ABI (from the project or the explorer), paste it for an exact report.
+3. Click **Use** next to the mint function. Its inputs are pre-filled with placeholders:
+   `{quantity}`, `{wallet}` (each wallet's own address) and `{proof}` (each wallet's allowlist
+   proof, which you paste in JSON or as `address, proof1 proof2` lines). Check them.
+4. Set the quantity, price per NFT (pre-filled from the contract when it can be read) and wallets.
+   For a launch at a set time, fill in **Start time** and a **Gas limit** (for example 200000).
+5. **Preview mint** test-runs every wallet on the chain. Type `MINT` to send.
+
+Scheduled mints wait, refresh 3 seconds before, run the test once more at the start time, and only
+send if it passes, so a mint that would fail costs nothing. **Fast mode** skips that last test to
+save a fraction of a second; a mint that then fails still costs gas.
+
+## If an RPC fails during a mint
+
+Each mint or transfer starts on the fastest healthy RPC link. If that link stops answering in the
+middle, requests switch to the next healthy link of the same network automatically and you get a
+notice. Sending the same signed transaction to a second link can never create a second
+transaction. Add a second RPC link for each network you mint on (**Networks → Add RPC URL**).
+
 ## Back up
 
 Copy the **`data`** folder (it has `vault.json` and `nft-ops.db`) somewhere safe, for example a
@@ -175,8 +202,11 @@ Your `data` folder is not touched by updates.
   addresses, signatures and RPC formats, so they cannot be added as networks here. For XRP, the
   **XRPL EVM** sidechain is included.
 
-- Minting supports **OpenSea SeaDrop ERC-721 drops** (the standard OpenSea drop contract) on any
-  configured chain. Other mint contracts come in a later stage.
+- The **Mint** page handles OpenSea SeaDrop drops; the **Contracts** page handles other mint
+  contracts. Mint functions that need a per-wallet signature from the project, or that take
+  struct (tuple) inputs, are recognised but cannot be used for custom mints yet.
+- Verified source code is looked up on Sourcify and the network's Blockscout explorer. Some
+  explorers block automated requests; then paste the ABI yourself.
 - Transfers send one transaction per NFT (ERC-721) or per sender-recipient pair (ERC-1155 batches
   several IDs together), and one per payment. There is no multi-send contract, so each transfer
   pays its own small gas fee.

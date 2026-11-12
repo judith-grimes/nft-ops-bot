@@ -138,6 +138,22 @@ CREATE TABLE IF NOT EXISTS nft_tokens (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (chain_id, contract, token_id, owner)
 );
+CREATE TABLE IF NOT EXISTS contract_reports (
+    chain_id    INTEGER NOT NULL,
+    address     TEXT NOT NULL,
+    report      TEXT NOT NULL,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (chain_id, address)
+);
+CREATE TABLE IF NOT EXISTS alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  REAL NOT NULL,
+    slug        TEXT,
+    kind        TEXT NOT NULL,
+    level       TEXT NOT NULL DEFAULT 'info',   -- info | good | warn
+    message     TEXT NOT NULL,
+    read        INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS settings (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -159,6 +175,10 @@ class Database:
 
     def _migrate(self) -> None:
         """Add columns introduced after Stage 1 to existing databases."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(collections)").fetchall()}
+        for column in ("watch INTEGER NOT NULL DEFAULT 1", "snapshot TEXT", "next_check REAL"):
+            if column.split()[0] not in cols:
+                self._conn.execute(f"ALTER TABLE collections ADD COLUMN {column}")
         have = {r[1] for r in self._conn.execute("PRAGMA table_info(history)").fetchall()}
         for column in ("asset TEXT", "token_id TEXT", "amount TEXT", "spend_wei TEXT"):
             if column.split()[0] not in have:

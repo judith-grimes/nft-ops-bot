@@ -36,10 +36,10 @@ class Env:
         self.wallets = WalletService(self.db, self.vault)
 
     def gateway_factory(self):
-        from osnm_z.chain import ChainGateway
+        from nft_ops.failover import FailoverGateway
 
-        def make(timeout: float, conns: int) -> ChainGateway:
-            gateway = ChainGateway(timeout, max_connections=conns)
+        def make(timeout: float, conns: int) -> FailoverGateway:
+            gateway = FailoverGateway(timeout, max_connections=conns)
             gateway._client = self.chain.client()
             return gateway
         return make

@@ -35,8 +35,10 @@ GAS_BUFFER = 1.2
 FEE_MULTIPLIER = 1.25          # same headroom osnm-z uses for an immediate send
 RECEIPT_TIMEOUT_SECONDS = 180
 CONFIRM_WORD = "SEND"
+CONFIRM_WORDS = {"custom_mint": "MINT"}
 KIND_LABELS = {"sweep": "Fund sweep", "distribute": "Fund distribution",
-               "nft_transfer": "NFT transfer"}
+               "nft_transfer": "NFT transfer", "custom_mint": "Custom mint"}
+PREFETCH_SECONDS = 3.0         # scheduled sends refresh nonce and balance this long before launch
 
 
 class TxEngineError(Exception):
@@ -58,7 +60,10 @@ class TxItem:
     sweep_max: bool = False   # native sweep: value = balance - reserve - gas, set in preview
     reserve_wei: int = 0
     external: bool = False    # recipient is not one of your wallets
-    verify: tuple | None = None   # ('erc721', contract, id) | ('erc1155', contract, id, amount)
+    verify: tuple | None = None   # ('erc721', c, id) | ('erc1155', c, id, n) | ('minted', c, qty)
+    scheduled_at: float | None = None   # unix time to send at (custom mints)
+    resimulate: bool = True             # re-run eth_estimateGas right before a scheduled send
+    fixed_gas: int = 0                  # user gas limit; used when the sale is not open yet
     gas_limit: int = 0
     status: str = "READY"
     reason: str = ""
@@ -167,7 +172,7 @@ class TxEngine:
                 item.status, item.reason = "BUSY", f"wallet is busy in operation #{self.busy_sources[item.source]}"
             elif self.external_busy(item.source) is not None:
                 item.status, item.reason = "BUSY", f"wallet is minting in operation #{self.external_busy(item.source)}"
-            elif item.source.lower() == item.recipient.lower():
+            elif item.kind != "custom_mint" and item.source.lower() == item.recipient.lower():
                 item.status, item.reason = "SAME_ADDRESS", "source and recipient are the same"
         await self._simulate(chain_id, items)
 
@@ -204,8 +209,14 @@ class TxEngine:
                     i.status, i.reason = "LIMIT_EXCEEDED", (
                         f"max gas cost {from_wei(gas_cost)} is over the per-transaction limit")
 
+        if kind == "custom_mint":
+            for i in items:
+                if i.status == "READY" and i.value > limits["max_value_per_tx"]:
+                    i.status, i.reason = "LIMIT_EXCEEDED", (
+                        f"mint value {from_wei(i.value)} is over the per-transaction limit")
         ready = [i for i in items if i.status == "READY"]
-        cap = limits["max_transfer_per_operation"]
+        # Mints use the mint limits; moving funds uses the transfer limit.
+        cap = limits["max_total_per_operation" if kind == "custom_mint" else "max_transfer_per_operation"]
         if move_cap.strip():
             cap = min(cap, to_wei(move_cap))
         moved = sum(i.native_out() for i in ready)
@@ -217,8 +228,9 @@ class TxEngine:
         if not ready:
             blocks.append("No transfer is ready.")
         if moved > cap:
-            blocks.append(f"This moves {from_wei(moved)} native coin, over the per-operation "
-                          f"limit {from_wei(cap)}. Raise the limit in Settings or select less.")
+            blocks.append(f"This {'spends' if kind == 'custom_mint' else 'moves'} {from_wei(moved)} "
+                          f"native coin, over the per-operation limit {from_wei(cap)}. Raise the "
+                          "limit in Settings or select less.")
         if daily_used + spend > limits["max_daily"]:
             blocks.append(f"24h spend would reach {from_wei(daily_used + spend)}, over the daily "
                           f"limit {from_wei(limits['max_daily'])}.")
@@ -229,7 +241,9 @@ class TxEngine:
                                              cap, time.time() + PREVIEW_TTL_SECONDS, title)
         return {
             "token": None if blocks else token, "expires_in": PREVIEW_TTL_SECONDS,
-            "kind": kind, "title": title, "chain_id": chain_id, "confirm_word": CONFIRM_WORD,
+            "kind": kind, "title": title, "chain_id": chain_id,
+            "confirm_word": CONFIRM_WORDS.get(kind, CONFIRM_WORD),
+            "scheduled_at": min((i.scheduled_at for i in ready if i.scheduled_at), default=None),
             "fees": {"max_fee_gwei": f"{max_fee / 1e9:.4f}", "priority_fee_gwei": f"{prio / 1e9:.4f}"},
             "rows": [i.public(max_fee) for i in items],
             "totals": {"ready": len(ready), "total": len(items), "native_moved": from_wei(moved),
@@ -256,11 +270,19 @@ class TxEngine:
                         "value": hex(0 if (item.sweep_max or plain) else item.value)}
                 try:
                     gas = int(await self.pool.call(chain_id, "eth_estimateGas", [call]), 16)
-                    item.gas_limit = max(21_000, math.ceil(gas * GAS_BUFFER))
+                    item.gas_limit = max(21_000, math.ceil(gas * GAS_BUFFER), item.fixed_gas)
                 except (RpcError, ValueError, TypeError) as error:
                     text = str(error)[:200]
                     if "insufficient funds" in text.lower():
                         item.status, item.reason = "INSUFFICIENT_FUNDS", text
+                    elif item.scheduled_at and item.scheduled_at > time.time() and item.fixed_gas:
+                        # Before launch most mints revert ("sale not active"). Use the user's gas
+                        # limit and decide at launch.
+                        item.gas_limit = item.fixed_gas
+                        item.reason = (f"test run fails now ({text[:80]}); "
+                                       + ("it is re-run right before sending and the mint is "
+                                          "skipped if it still fails" if item.resimulate else
+                                          "FAST MODE: sent at launch without a re-check"))
                     else:
                         item.status, item.reason = "SIMULATION_FAILED", text
         await asyncio.gather(*(one(i) for i in items))
@@ -272,12 +294,14 @@ class TxEngine:
 
     # ===== start ==========================================================================
     async def start(self, token: str, confirmation: str) -> int:
-        if confirmation.strip().upper() != CONFIRM_WORD:
-            raise TxEngineError(f"type {CONFIRM_WORD} to confirm")
         self._expire()
-        preview = self.previews.pop(token, None)
+        preview = self.previews.get(token)
         if preview is None:
             raise TxEngineError("preview expired or already used; preview again")
+        word = CONFIRM_WORDS.get(preview.kind, CONFIRM_WORD)
+        if confirmation.strip().upper() != word:
+            raise TxEngineError(f"type {word} to confirm")
+        self.previews.pop(token, None)
         with self.safety.lock:
             if self.safety.stopped:
                 raise TxEngineError("emergency STOP is active")
@@ -332,12 +356,32 @@ class TxEngine:
         sent: list[TxRun] = []
         try:
             signer = self.vault.signer(source)
+            launch = min((r.item.scheduled_at for r in runs if r.item.scheduled_at), default=None)
+            if launch and launch > time.time():
+                for run in runs:
+                    run.phase, run.message = "waiting", f"sends at {time.strftime('%H:%M:%S', time.localtime(launch))}"
+                    self._publish(job, run)
+                if not await self._wait_until(launch - PREFETCH_SECONDS):
+                    for run in runs:
+                        self._finish(job, run, "cancelled", "STOP pressed while waiting; nothing sent")
+                    return
             nonce = int(await self.pool.call(preview.chain_id, "eth_getTransactionCount",
                                              [source, "pending"]), 16)
             balance = int(await self.pool.call(preview.chain_id, "eth_getBalance",
                                                [source, "pending"]), 16)
+            if launch and not await self._wait_until(launch):
+                for run in runs:
+                    self._finish(job, run, "cancelled", "STOP pressed while waiting; nothing sent")
+                return
             for index, run in enumerate(runs):
                 item = run.item
+                if item.scheduled_at and item.resimulate and item.data:
+                    problem = await self._recheck(preview.chain_id, item)
+                    if problem:
+                        self._finish(job, run, "not_submitted", f"skipped, test run at launch failed: {problem}")
+                        for rest in runs[index + 1:]:
+                            self._finish(job, rest, "not_submitted", "skipped: an earlier item failed its test run")
+                        return
                 if item.sweep_max:
                     # Recompute from the live balance so the gas reserve is never touched.
                     other_gas = sum(r.item.gas_limit for r in runs) * preview.max_fee
@@ -367,7 +411,8 @@ class TxEngine:
                     max_cost_wei=str(item.spend() + item.gas_limit * preview.max_fee))
                 sent.append(run)  # track from here on, even if the send result is unclear
                 try:
-                    await self._send(preview.rpc_url, "0x" + signed.raw.hex(), signed.hash_hex)
+                    await self._send(preview.chain_id, preview.rpc_url, "0x" + signed.raw.hex(),
+                                     signed.hash_hex)
                 except (RpcError, ValueError) as error:
                     sent.remove(run)
                     self._finish(job, run, "failed", f"send rejected: {error}")
@@ -383,6 +428,25 @@ class TxEngine:
         finally:
             await self._track(job, sent)
 
+    async def _wait_until(self, target: float) -> bool:
+        """Sleep until `target` (unix time). Returns False if STOP is pressed meanwhile."""
+        while True:
+            if self.safety.stopped:
+                return False
+            left = target - time.time()
+            if left <= 0:
+                return True
+            await asyncio.sleep(min(0.25, left) if left > 0.3 else max(0.0, left - 0.002))
+
+    async def _recheck(self, chain_id: int, item: TxItem) -> str | None:
+        call = {"from": item.source, "to": item.target, "data": "0x" + item.data.hex(),
+                "value": hex(item.value), "gas": hex(item.gas_limit)}
+        try:
+            await self.pool.call(chain_id, "eth_estimateGas", [call])
+        except (RpcError, ValueError, TypeError) as error:
+            return str(error)[:200]
+        return None
+
     def _gate(self, job: TxJob, item: TxItem) -> None:
         with self.safety.lock:
             if self.safety.stopped:
@@ -391,6 +455,8 @@ class TxEngine:
             gas_cost = item.gas_limit * job.preview.max_fee
             if gas_cost > limits["max_gas_cost_per_tx"]:
                 raise GateBlocked("blocked: gas cost over the per-transaction limit")
+            if job.preview.kind == "custom_mint" and item.value > limits["max_value_per_tx"]:
+                raise GateBlocked("blocked: mint value over the per-transaction limit")
             if job.moved_wei + item.native_out() > job.preview.move_cap:
                 raise GateBlocked("blocked: operation would move more than its limit")
             daily = self.safety.daily_spent_wei(job.preview.chain_id)
@@ -398,13 +464,15 @@ class TxEngine:
                 raise GateBlocked("blocked: over the 24h spending limit")
             job.moved_wei += item.native_out()
 
-    async def _send(self, url: str, raw: str, local_hash: str) -> None:
+    async def _send(self, chain_id: int, url: str, raw: str, local_hash: str) -> None:
         try:
-            returned = await self.pool._single(url, "eth_sendRawTransaction", [raw])
+            returned, used = await self.pool.send_raw(chain_id, url, raw)
         except RpcError as error:
             if "already known" in str(error).lower():
                 return
             raise
+        if used != url:
+            self.bus.publish("failover", chain_id=chain_id, operation="transfer")
         if not isinstance(returned, str) or returned.lower() != local_hash.lower():
             raise RpcError("RPC returned a different transaction hash")
 
@@ -426,15 +494,21 @@ class TxEngine:
                     self._finish(job, run, "failed", "transaction reverted",
                                  gas_used=gas_used, gas_cost_wei=str(cost))
                     continue
-                note = await self._verify(job.preview.chain_id, run.item)
+                note = await self._verify(job.preview.chain_id, run.item, receipt)
                 self._finish(job, run, "confirmed", note, gas_used=gas_used, gas_cost_wei=str(cost))
             waiting = still
         for run in waiting:
             self._finish(job, run, "pending", "sent; not confirmed yet — check the explorer")
 
-    async def _verify(self, chain_id: int, item: TxItem) -> str:
+    async def _verify(self, chain_id: int, item: TxItem, receipt: dict | None = None) -> str:
         if not item.verify:
             return "confirmed"
+        if item.verify[0] == "minted":
+            got = minted_to(receipt or {}, item.verify[1], item.source)
+            if got >= int(item.verify[2]):
+                return f"minted {got} NFT(s); proven by the receipt"
+            return (f"confirmed, but the receipt shows {got} of {item.verify[2]} NFT(s) minted to "
+                    "this wallet — check the explorer")
         from . import nfts  # local import: nfts imports this module's types
         try:
             ok = await nfts.verify_owner(self.pool, chain_id, item.verify, item.recipient)
@@ -458,3 +532,25 @@ class TxEngine:
     def list_jobs(self) -> list[dict]:
         return [j.summary() for j in sorted(self.jobs.values(), key=lambda j: -j.id)]
 
+
+
+TRANSFER_TOPIC = "0x" + __import__("eth_utils").crypto.keccak(text="Transfer(address,address,uint256)").hex()
+TRANSFER_SINGLE_TOPIC = "0x" + __import__("eth_utils").crypto.keccak(
+    text="TransferSingle(address,address,address,uint256,uint256)").hex()
+
+
+def minted_to(receipt: dict, contract: str, wallet: str) -> int:
+    """Count NFTs minted (from the zero address) to `wallet` by `contract` in a receipt."""
+    zero = "0x" + "00" * 32
+    me = "0x" + "00" * 12 + wallet[2:].lower()
+    count = 0
+    for log in receipt.get("logs") or []:
+        if str(log.get("address", "")).lower() != contract.lower():
+            continue
+        topics = [t.lower() for t in log.get("topics") or []]
+        if len(topics) == 4 and topics[0] == TRANSFER_TOPIC and topics[1] == zero and topics[2] == me:
+            count += 1
+        elif (len(topics) == 4 and topics[0] == TRANSFER_SINGLE_TOPIC and topics[2] == zero
+              and topics[3] == me):
+            count += int(log.get("data", "0x")[66:130] or "0", 16)
+    return count

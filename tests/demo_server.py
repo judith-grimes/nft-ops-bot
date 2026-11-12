@@ -18,7 +18,7 @@ import uvicorn
 
 sys.path.insert(0, str(Path(__file__).parent))
 from conftest import Env
-from fakes import FakeOpenSea, allowlist_metadata
+from fakes import CustomDrop, FakeOpenSea, allowlist_metadata
 
 from nft_ops.server import AppState, create_app
 
@@ -50,6 +50,8 @@ def main() -> None:
     env.chain._dispatch = rich
     delay = float(os.environ.get("DEMO_START_DELAY", "90"))
     metadata = allowlist_metadata(time.time() + delay, time.time() + 3600)
+    custom = "0x4444444444444444444444444444444444444444"
+    env.chain.custom[custom] = CustomDrop(custom)          # a non-OpenSea drop, sale open
     holder: dict = {}
     state = AppState(tmp / "data", opensea_factory=lambda: DemoOpenSea(metadata, holder["s"]),
                      pool=env.pool, gateway_factory=env.gateway_factory())

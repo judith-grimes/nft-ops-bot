@@ -24,12 +24,24 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 
 from osnm_z.opensea_protocol import ProtocolError
 
-from . import __version__, addressbook, balances, collections, eligibility, nfts, transfers
+from . import (
+    __version__,
+    addressbook,
+    balances,
+    collections,
+    contracts,
+    custommint,
+    eligibility,
+    nfts,
+    transfers,
+)
 from .balances import format_units
 from .collections import CollectionError, OpenSeaFactory, default_opensea_factory
+from .contracts import ContractError
 from .db import Database
 from .events import EventBus
 from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
+from .monitor import Monitor
 from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
 from .nfts import NftError
 from .safety import LIMIT_LABELS, Safety, from_wei
@@ -39,6 +51,7 @@ from .wallets import WalletError, WalletService, checksum, safe_cell
 
 STATIC = Path(__file__).parent / "static"
 USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
+               ContractError,
                RpcError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
@@ -64,6 +77,21 @@ class AppState:
         # A wallet can be in a mint or a transfer operation, never both (nonce safety).
         self.tx.external_busy = self.mint.active_wallets.get
         self.mint.external_busy = self.tx.busy_sources.get
+        self.monitor = Monitor(self.db, self.pool, self.bus, self.opensea_factory, self.auto_rescan)
+
+    async def auto_rescan(self, slug: str) -> dict | None:
+        """Monitor-triggered eligibility re-check (skipped if a manual scan is running)."""
+        if self.scan_task and not self.scan_task.done():
+            return None
+        meta = collections.get(self.db, slug)
+        addresses = [r["address"] for r in self.db.all(
+            "SELECT DISTINCT address FROM eligibility WHERE slug = ?", (slug,))] or [
+            r["address"] for r in self.db.all("SELECT address FROM wallets WHERE has_key = 1")]
+        settings = self.db.get_setting("eligibility", {}) or {}
+        return await eligibility.scan(self.db, self.opensea_factory, self.vault, meta, addresses,
+                                      concurrency=int(settings.get("concurrency", 3)),
+                                      spacing_seconds=float(settings.get("spacing_seconds", 0.3)),
+                                      should_stop=lambda: self.safety.stopped)
 
 
 def create_app(state: AppState, port: int) -> FastAPI:
@@ -78,10 +106,12 @@ def create_app(state: AppState, port: int) -> FastAPI:
                         pass
                 await asyncio.sleep(60)
         task = asyncio.create_task(health_loop())
+        monitor_task = asyncio.create_task(state.monitor.run_forever())
         try:
             yield
         finally:
             task.cancel()
+            monitor_task.cancel()
 
     app = FastAPI(title="nft-ops", docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)
@@ -181,7 +211,9 @@ def create_app(state: AppState, port: int) -> FastAPI:
         db = state.db
         wallets = db.one("SELECT COUNT(*) AS n, SUM(has_key) AS k FROM wallets")
         totals = []
-        for net in db.all("SELECT chain_id, name, native_symbol FROM networks WHERE enabled = 1"):
+        for net in db.all("SELECT chain_id, name, native_symbol FROM networks WHERE enabled = 1 AND "
+                          "(chain_id = 4663 OR chain_id IN (SELECT DISTINCT chain_id FROM balances)) "
+                          "ORDER BY chain_id != 4663, name"):
             amount = sum(int(r["amount"]) for r in db.all(
                 "SELECT amount FROM balances WHERE chain_id = ? AND asset = 'native'",
                 (net["chain_id"],)))
@@ -455,6 +487,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
     @app.get("/api/settings")
     async def settings_get() -> dict:
         return {"limits": state.safety.limits_text(), "limit_labels": LIMIT_LABELS,
+                "monitor": state.monitor.settings(),
                 "mint": {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})},
                 "eligibility": {"concurrency": 3, "spacing_seconds": 0.3,
                                 **(state.db.get_setting("eligibility", {}) or {})}}
@@ -484,6 +517,63 @@ def create_app(state: AppState, port: int) -> FastAPI:
             state.db.set_setting("eligibility", {"concurrency": concurrency,
                                                  "spacing_seconds": spacing})
         return ok()
+
+    # ----- contracts (analyser + custom mints) -----------------------------------------
+    @app.get("/api/contracts")
+    async def contracts_list() -> dict:
+        return {"reports": contracts.reports(state.db)}
+
+    @app.post("/api/contracts/analyze")
+    async def contracts_analyze(request: Request) -> dict:
+        data = await body(request)
+        report = await contracts.analyze(state.db, state.pool, int(data["chain_id"]),
+                                         checksum(str(data["address"])), str(data.get("abi") or ""))
+        report.pop("abi", None)
+        return ok(report=report)
+
+    @app.post("/api/contracts/mint/preview")
+    async def contracts_mint_preview(request: Request) -> dict:
+        data = await body(request)
+        chain_id = int(data["chain_id"])
+        start_at = float(data["start_at"]) if data.get("start_at") else None
+        if start_at and start_at < time.time() - 5:
+            raise ValueError("start time is in the past")
+        wallets = [a for a in selection(data) if state.vault.has(a)]
+        if not wallets:
+            raise ValueError("no selected wallet has a key")
+        items, notes = custommint.plan(
+            state.db, chain_id, str(data["address"]), contracts.canonical(str(data["signature"])),
+            [str(a) for a in data.get("args", [])], int(data.get("quantity", 1)),
+            str(data.get("price", "0")), wallets, str(data.get("proofs", "")), start_at,
+            int(data.get("gas_limit") or 0), bool(data.get("resimulate", True)),
+            str(data.get("label", ""))[:30])
+        return await state.tx.preview("custom_mint", chain_id, items, "Custom mint",
+                                      str(data.get("cap") or ""), notes)
+
+    # ----- monitor & alerts ------------------------------------------------------------
+    @app.get("/api/alerts")
+    async def alerts_list() -> dict:
+        return state.monitor.alerts()
+
+    @app.post("/api/alerts/read")
+    async def alerts_read() -> dict:
+        state.monitor.mark_read()
+        return ok()
+
+    @app.post("/api/collections/watch")
+    async def collections_watch(request: Request) -> dict:
+        data = await body(request)
+        state.monitor.set_watch(str(data["slug"]), bool(data.get("watch", True)))
+        return ok()
+
+    @app.post("/api/collections/check")
+    async def collections_check(request: Request) -> dict:
+        data = await body(request)
+        return ok(snapshot=await state.monitor.check(str(data["slug"])))
+
+    @app.post("/api/monitor/settings")
+    async def monitor_settings(request: Request) -> dict:
+        return ok(settings=state.monitor.set_settings(await body(request)))
 
     # ----- address book & recipient lists ----------------------------------------------
     @app.get("/api/addressbook")

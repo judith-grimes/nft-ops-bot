@@ -117,3 +117,12 @@ details summary { cursor: pointer; }
   #nav { order: 3; flex: 1 0 100%; flex-wrap: nowrap; overflow-x: auto; }
   #nav a { white-space: nowrap; }
 }
+
+.bell { position: relative; padding: 4px 8px; font-size: 16px; line-height: 1; }
+.bell .count { position: absolute; top: -4px; right: -6px; background: var(--bad); color: #fff;
+  font-size: 10.5px; font-weight: 700; border-radius: 999px; padding: 1px 5px; }
+.alert-row { display: grid; grid-template-columns: auto 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.alert-row:last-child { border-bottom: 0; }
+.alert-row.unread .msg { font-weight: 600; }
+.dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; background: var(--info); }
+.dot.good { background: var(--good); } .dot.warn { background: var(--warn); }

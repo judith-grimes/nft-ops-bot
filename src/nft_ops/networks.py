@@ -59,6 +59,13 @@ class RpcError(Exception):
     pass
 
 
+class RpcTransportError(RpcError):
+    """The endpoint did not give a usable answer (network, HTTP status, not JSON).
+
+    Only these are safe to retry on another endpoint; a JSON-RPC error is a real answer.
+    """
+
+
 def validate_rpc_url(url: str) -> str:
     url = url.strip()
     parts = urlsplit(url)
@@ -138,6 +145,27 @@ class RpcPool:
             health = {1: 0, None: 1, 0: 2}[r["healthy"]]
             return (health, r["latency_ms"] if r["latency_ms"] is not None else 1e9, r["priority"])
         return [Endpoint(r["id"], r["url"]) for r in sorted(rows, key=rank)]
+
+    def healthy_urls(self, chain_id: int) -> list[str]:
+        """Endpoints whose last health check confirmed the right chain, fastest first."""
+        return [r["url"] for r in self._db.all(
+            "SELECT url FROM rpc_endpoints WHERE chain_id = ? AND enabled = 1 AND healthy = 1 "
+            "ORDER BY latency_ms", (chain_id,))]
+
+    async def send_raw(self, chain_id: int, primary: str, raw: str) -> tuple[Any, str]:
+        """eth_sendRawTransaction on the primary, falling back only if it gave no answer.
+
+        Returns (result, url used). Identical signed bytes cannot create a second transaction.
+        """
+        urls = [primary] + [u for u in self.healthy_urls(chain_id) if u != primary]
+        last: RpcTransportError | None = None
+        for url in urls:
+            try:
+                return await self._single(url, "eth_sendRawTransaction", [raw]), url
+            except RpcTransportError as error:
+                last = error
+        assert last is not None
+        raise last
 
     async def best_url(self, chain_id: int) -> str:
         """A verified, healthy endpoint for a mint job (re-checks stale health data)."""
@@ -219,20 +247,24 @@ class RpcPool:
 
     async def _single(self, url: str, method: str, params: list) -> Any:
         envelope = self._envelope(method, params)
-        response = await self._client.post(url, json=envelope)
+        try:
+            response = await self._client.post(url, json=envelope)
+        except httpx.HTTPError as error:
+            raise RpcTransportError(f"connection failed: {type(error).__name__}") from None
         if response.status_code == 429:
-            raise RpcError("rate limited")
+            raise RpcTransportError("rate limited")
         if response.status_code >= 400:
             try:
                 body = response.json()
             except ValueError:
                 body = None
             message = _error_text(body.get("error")) if isinstance(body, dict) and body.get("error") else None
-            raise RpcError(f"HTTP {response.status_code}: {message}" if message else f"HTTP {response.status_code}")
+            raise RpcTransportError(f"HTTP {response.status_code}: {message}" if message
+                                    else f"HTTP {response.status_code}")
         try:
             body = response.json()
         except ValueError:
-            raise RpcError("endpoint did not return JSON") from None
+            raise RpcTransportError("endpoint did not return JSON") from None
         if isinstance(body, dict) and body.get("error") and "result" not in body:
             # Provider errors often lack a matching id; show the provider's own message.
             raise RpcError(_error_text(body["error"]))

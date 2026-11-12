@@ -16,7 +16,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from osnm_z.chain import ChainGateway
 from osnm_z.config import (
     GWEI_IN_WEI,
     AppConfig,
@@ -54,6 +53,7 @@ from . import collections, nfts
 from .collections import OpenSeaFactory
 from .db import Database
 from .events import EventBus
+from .failover import make_gateway
 from .networks import RpcError, RpcPool
 from .safety import GateBlocked, OperationBudget, Safety, from_wei, to_wei
 from .vault import Vault
@@ -186,8 +186,7 @@ class MintEngine:
                  ) -> None:
         self.db, self.vault, self.pool, self.bus, self.safety = db, vault, pool, bus, safety
         self.opensea_factory = opensea_factory
-        self.gateway_factory = gateway_factory or (
-            lambda timeout, conns: ChainGateway(timeout, max_connections=conns))
+        self.gateway_factory = gateway_factory or make_gateway
         self.jobs: dict[int, MintJob] = {}
         self.previews: dict[str, Preview] = {}
         self.active_wallets: dict[str, int] = {}
@@ -428,6 +427,7 @@ class MintEngine:
                 chain = await gateway.prepare_chain(preview.rpc_url)
                 if chain.chain_id != preview.metadata.network_id:
                     raise MintEngineError("RPC chain changed since the preview")
+                self._attach_backups(gateway, job, chain.chain_id, preview.rpc_url)
                 public_target = None
                 if preview.stage.stage_type == "PUBLIC_SALE":
                     client = self.opensea_factory()
@@ -526,6 +526,17 @@ class MintEngine:
                 self._finish(run, "not_submitted", str(error)[:300])
         finally:
             await client.aclose()
+
+    def _attach_backups(self, gateway: Any, job: MintJob, chain_id: int, primary: str) -> None:
+        """Give the mint gateway the other healthy endpoints of this chain as backups."""
+        if not hasattr(gateway, "set_backups"):
+            return
+        gateway.set_backups([u for u in self.pool.healthy_urls(chain_id) if u != primary])
+
+        def on_failover(_primary: str, _used: str, error: object) -> None:
+            self.bus.publish("failover", chain_id=chain_id, operation="mint", job=job.id,
+                             reason=str(error)[:200])
+        gateway.on_failover = on_failover
 
     def _record_minted(self, metadata: CollectionMetadata, wallet: str, quantity: int,
                        receipt: Any) -> None:
