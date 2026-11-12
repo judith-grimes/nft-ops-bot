@@ -26,12 +26,14 @@ DEFAULT_LIMITS = {
     "max_gas_cost_per_tx": "0.01",
     "max_total_per_operation": "0.5",
     "max_daily": "1.0",
+    "max_transfer_per_operation": "1.0",
 }
 LIMIT_LABELS = {
     "max_value_per_tx": "maximum mint value per transaction",
     "max_gas_cost_per_tx": "maximum gas cost per transaction",
     "max_total_per_operation": "maximum total spend per operation",
     "max_daily": "maximum spend per 24 hours (per network)",
+    "max_transfer_per_operation": "maximum native coin moved by one sweep or distribution",
 }
 
 
@@ -123,16 +125,19 @@ class Safety:
         """Spend in the last 24h: actual cost where known, else the reserved worst case."""
         since = time.time() - 86_400
         rows = self._db.all(
-            "SELECT status, value_wei, max_cost_wei, gas_cost_wei FROM history "
+            "SELECT status, value_wei, spend_wei, max_cost_wei, gas_cost_wei FROM history "
             "WHERE chain_id = ? AND created_at >= ? AND tx_hash IS NOT NULL",
             (chain_id, since),
         )
         total = 0
         for r in rows:
+            # spend_wei is what leaves your wallets (mint price, payments to outside
+            # addresses). Moves between your own wallets record spend_wei = 0.
+            spend = r["spend_wei"] if r["spend_wei"] is not None else r["value_wei"]
             if r["gas_cost_wei"] is not None:
                 total += int(r["gas_cost_wei"])
-                if r["status"] == "confirmed" and r["value_wei"]:
-                    total += int(r["value_wei"])
+                if r["status"] == "confirmed" and spend:
+                    total += int(spend)
             elif r["max_cost_wei"]:
                 total += int(r["max_cost_wei"])
         return total + extra_in_flight

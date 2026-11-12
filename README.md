@@ -11,7 +11,7 @@ that OpenSea drops use.
 The minting engine is [osnm-z](https://github.com/zunmax/osnm-z) (commit `b001c82`), copied in and
 checked by a test so nobody can quietly change it. See [VENDORED.md](VENDORED.md).
 
-## What it does (Stage 1)
+## What it does
 
 | Page | What you can do |
 | --- | --- |
@@ -20,7 +20,8 @@ checked by a test so nobody can quietly change it. See [VENDORED.md](VENDORED.md
 | **Collections** | Add an OpenSea drop by link, slug or contract. See every phase, its times, price, per-wallet limit and how many of your wallets are eligible. |
 | **Eligibility** | Scan all wallets (or a group). Each wallet signs in to OpenSea and gets OpenSea's own answer. Filter by status, export CSV. |
 | **Mint** | Pick a phase and wallets, preview every wallet (eligibility, balance, gas, allocation, limits; public phases are simulated on-chain), type `MINT`, and all ready wallets mint in parallel with live status. |
-| **History** | Every mint attempt with its transaction hash, cost and result. CSV export. |
+| **Transfers** | **NFTs:** find your NFTs (ERC-721 and ERC-1155) and consolidate them into one wallet or distribute them to many. **Sweep:** collect ETH or a token from many wallets into one, keeping a gas reserve in each. **Distribute:** send ETH or a token to many addresses: same amount each, split a total equally or by percent, custom amounts, or many-to-many from a CSV. **Address book:** approved outside destinations and saved recipient lists. |
+| **History** | Every mint and transfer with its transaction hash, amount, recipient, cost and result. CSV export. |
 | **Networks** | Several RPC links per chain, with health, speed and automatic fallback. Robinhood Chain (4663) is set up by default. |
 | **Settings** | Spending limits, mint defaults, scan speed, vault password, lock. |
 
@@ -35,7 +36,14 @@ immediately, and stays on (even after a restart) until you type `RESUME`.
 - **Only your computer can open the dashboard.** It listens on `127.0.0.1`, and every request needs
   the login you get by typing your password.
 - **Nothing is sent without your OK.** Every mint shows a full preview first and needs you to type
-  `MINT`.
+  `MINT`. Every transfer shows each "from → to" row first and needs you to type `SEND`. Only the
+  rows shown as READY are sent, exactly as previewed.
+- **Sweeps and NFT consolidation only go to your own wallets or the address book.** Payments to
+  addresses that are not your wallets are marked "outside" and count toward the 24-hour limit.
+- **Gas reserves are protected.** A sweep re-reads each wallet's balance right before sending and
+  never touches the reserve you set.
+- **One job per wallet.** A wallet that is minting can't be used for a transfer at the same time
+  (and the other way round), so transactions never collide.
 - **Spending limits are checked at the last moment**, right before each transaction is sent, not
   just in the preview. If a limit would be crossed, that transaction is not sent.
 - **Eligibility is not the same as ready.** "Eligible" means OpenSea says the wallet qualifies.
@@ -119,6 +127,27 @@ Closing it stops the app. Don't close it during a mint.
    countdown and sends right on time. Keep the window open.
 6. Watch each wallet's status. Click a transaction hash to open it in the block explorer.
 
+## Moving NFTs and funds (Transfers page)
+
+Choose the network at the top right first. Every tab ends in a **Preview**: check each row, type
+`SEND`, and watch the status of each transfer below.
+
+- **NFTs:** pick the collection (or paste a contract address) → **Load** → **Find my NFTs**. Your
+  mint records and the contract's own token list are checked first. If nothing shows up, enter a
+  look-back (for example `2000000` blocks) to also scan transfer history, or **Add token IDs** by
+  hand. Tick the NFTs, then choose **Consolidate** (all into one wallet) or **Distribute** (one
+  address per line; they are dealt out in order, or use a CSV `address,token_id` to choose exactly).
+- **Sweep funds:** choose ETH or a token, the wallets to collect from, the destination, and how much
+  ETH to leave in each wallet for gas. To sweep a token, track it on the Wallets page first
+  (**Track token**).
+- **Distribute funds:** choose the paying wallet and how to split. Paste recipients (one per line,
+  or CSV), or load a saved list. **Check list** validates every address and amount first.
+- **Address book:** add outside addresses you trust (cold storage, exchange deposit). Only these
+  and your own wallets can receive sweeps and NFT consolidations.
+
+The **maximum native coin moved by one sweep or distribution** limit (Settings, default 1 ETH)
+stops large moves by mistake. Raise it when you mean to move more.
+
 ## Back up
 
 Copy the **`data`** folder (it has `vault.json` and `nft-ops.db`) somewhere safe, for example a
@@ -142,9 +171,13 @@ Your `data` folder is not touched by updates.
 
 ## Known limits
 
-- Stage 1 mints **OpenSea SeaDrop ERC-721 drops** (the standard OpenSea drop contract) on any
-  configured chain. Other contracts, batch NFT transfers, fund sweeping and fund distribution come
-  in later stages.
+- Minting supports **OpenSea SeaDrop ERC-721 drops** (the standard OpenSea drop contract) on any
+  configured chain. Other mint contracts come in a later stage.
+- Transfers send one transaction per NFT (ERC-721) or per sender-recipient pair (ERC-1155 batches
+  several IDs together), and one per payment. There is no multi-send contract, so each transfer
+  pays its own small gas fee.
+- Finding NFTs by transfer history depends on your RPC allowing log searches; some public RPCs
+  limit them. Adding token IDs by hand always works.
 - "Fast" is not a guarantee. All wallets send at the same moment, already prepared, but on a busy
   FCFS mint other people may pay more gas, and the network decides who gets in first.
 - Every wallet signs in to OpenSea to check eligibility. With many wallets, OpenSea may slow you

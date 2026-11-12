@@ -8,9 +8,12 @@ const S = {
   networks: [], selected: new Set(), walletFilter: { group: "", q: "" },
   elig: { slug: "", filter: "ALL", stage: "ALL" },
   mint: { slug: "", stage: "", source: "eligible", group: "", preview: null },
+  tx: { tab: "nfts", preview: null, nft: { contract: "", data: null, picked: new Set(), mode: "consolidate" },
+        sweep: { asset: "native", source: "group", group: "", reserve: "0.0005", min_balance: "0" },
+        dist: { asset: "native", mode: "equal_each" } },
   stopped: false,
 };
-const PAGES = ["overview", "wallets", "collections", "eligibility", "mint", "history", "networks", "settings"];
+const PAGES = ["overview", "wallets", "collections", "eligibility", "mint", "transfers", "history", "networks", "settings"];
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -188,6 +191,7 @@ async function startEvents() {
 function onEvent(ev) {
   if (ev.kind === "safety") setStopped(ev.stopped);
   if (["run", "job", "mint_log"].includes(ev.kind) && ["mint", "overview"].includes(S.page)) scheduleRefresh();
+  if (["txrun", "txjob"].includes(ev.kind) && ["transfers", "overview"].includes(S.page)) scheduleRefresh();
   if (ev.kind === "eligibility" && S.page === "eligibility") {
     const bar = $("#scan-bar"); if (bar) { bar.style.width = `${(100 * ev.done) / ev.total}%`; $("#scan-text").textContent = `${ev.done} / ${ev.total} wallets checked`; }
   }
@@ -197,7 +201,9 @@ function scheduleRefresh() {
   if (refreshTimer) return;
   refreshTimer = setTimeout(async () => {
     refreshTimer = null;
-    if (S.page === "mint") await renderJobs(); else if (S.page === "overview") await render();
+    if (S.page === "mint") await renderJobs();
+    else if (S.page === "transfers") await renderTxJobs();
+    else if (S.page === "overview") await render();
   }, 600);
 }
 
@@ -230,7 +236,7 @@ async function renderOverview() {
         ${d.upcoming.map((s) => `<tr><td>${esc(s.slug)}<div class="tiny muted">${esc(s.chain_name)}</div></td><td>${esc(s.name)}</td><td>${badge(s.state)}</td>
           <td>${s.state === "upcoming" ? countdown(s.starts_at) : "open"}</td><td class="num">${s.eligible_wallets}</td></tr>`).join("")}</table></div>`
         : `<div class="empty">No upcoming phases. Add a collection.</div>`}</div>
-      <div class="panel"><h2>Active operations</h2>${d.active_jobs.length ? d.active_jobs.map(jobCard).join("") : `<div class="empty">Nothing running.</div>`}</div>
+      <div class="panel"><h2>Active operations</h2>${d.active_jobs.length || d.active_tx_jobs.length ? d.active_jobs.map(jobCard).join("") + d.active_tx_jobs.map(txJobCard).join("") : `<div class="empty">Nothing running.</div>`}</div>
     </div>
     <div class="panel"><h2>Recent transactions</h2>${historyTable(d.recent)}</div>`;
 }
@@ -484,9 +490,9 @@ function jobCard(j) {
 function historyTable(rows) {
   if (!rows.length) return `<div class="empty">No transactions yet.</div>`;
   return `<div class="table-wrap"><table>
-    <tr><th>Time</th><th>Wallet</th><th>Operation</th><th>Collection</th><th>Status</th><th>Transaction</th><th class="num">Value</th><th class="num">Gas</th><th>Error</th></tr>
+    <tr><th>Time</th><th>Wallet</th><th>Operation</th><th>Details</th><th>Status</th><th>Transaction</th><th class="num">Value</th><th class="num">Gas</th><th>Error</th></tr>
     ${rows.map((r) => `<tr><td class="tiny">${esc(fmtTime(r.created_at))}</td><td>${addr(r.address)}</td><td>${esc(r.operation)} #${r.job_id ?? ""}</td>
-      <td>${esc(r.slug || "")}<div class="tiny muted">${esc(r.stage_name || "")}</div></td><td>${badge(r.status)}</td><td>${txLink(r.chain_id, r.tx_hash)}</td>
+      <td>${r.operation === "mint" ? `${esc(r.slug || "")}<div class="tiny muted">${esc(r.stage_name || "")}</div>` : `${esc(r.amount || "")} ${esc(assetName(r.asset, r.chain_id))}${r.token_id ? ` #${esc(r.token_id)}` : ""}<div class="tiny muted">→ ${esc(short(r.recipient))}</div>`}</td><td>${badge(r.status)}</td><td>${txLink(r.chain_id, r.tx_hash)}</td>
       <td class="num">${r.value_wei ? esc(weiToStr(r.value_wei)) : "—"}</td><td class="num">${r.gas_cost_wei ? esc(weiToStr(r.gas_cost_wei)) : "—"}</td>
       <td class="wrap tiny">${esc(r.error || "")}</td></tr>`).join("")}</table></div>`;
 }
@@ -565,7 +571,285 @@ async function renderSettings() {
   $("#pw-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/vault/password", formData(e.target)); e.target.reset(); toast("Password changed"); }); };
 }
 
-const PAGE_RENDER = { overview: renderOverview, wallets: renderWallets, collections: renderCollections, eligibility: renderEligibility, mint: renderMint, history: renderHistory, networks: renderNetworks, settings: renderSettings };
+const ACTIONS_EXTRA = {};
+
+// ---------------------------------------------------------------- transfers
+function assetName(asset, chainId) {
+  if (!asset) return "";
+  if (asset === "native") return symbol(chainId);
+  if (asset.startsWith("erc721:") || asset.startsWith("erc1155:")) return `NFT ${short(asset.split(":")[1])}`;
+  const t = (S.tokens || []).find((x) => x.address === asset);
+  return t ? t.symbol : short(asset);
+}
+async function renderTransfers() {
+  const t = S.tx;
+  const [w, book] = await Promise.all([api(`/api/wallets?chain_id=${S.chainId}`), api("/api/addressbook")]);
+  S.tokens = w.tokens; S.book = book; S.walletData = w;
+  const tabs = [["nfts", "NFTs"], ["sweep", "Sweep funds"], ["distribute", "Distribute funds"], ["book", "Address book"]];
+  $("#main").innerHTML = `
+    <div class="page-head"><h1>Transfers</h1><label>Network ${chainSelect("t-chain", S.chainId)}</label></div>
+    <div class="chips">${tabs.map(([k, l]) => `<button class="${t.tab === k ? "on" : ""}" data-action="tx-tab" data-tab="${k}">${esc(l)}</button>`).join("")}</div>
+    <div id="tx-body"></div><div id="tx-preview">${t.preview ? txPreviewHTML(t.preview) : ""}</div><div id="txjobs"></div>`;
+  $("#t-chain").onchange = (e) => { S.chainId = Number(e.target.value); localStorageSet("nftops.chain", S.chainId); t.preview = null; t.nft.data = null; render(); };
+  await ({ nfts: tabNfts, sweep: tabSweep, distribute: tabDistribute, book: tabBook })[t.tab](w, book);
+  await renderTxJobs();
+}
+function destinationOptions(w, book, value) {
+  const own = w.wallets.map((x) => ({ v: x.address, l: `${x.label || short(x.address)} (your wallet)` }));
+  const ext = book.entries.map((x) => ({ v: x.address, l: `${x.label || short(x.address)} (address book)` }));
+  return options([...own, ...ext], value, (o) => o.l, (o) => o.v);
+}
+function sourceControls(prefix, cfg, w) {
+  return `<label>From wallets <select id="${prefix}-source">
+      <option value="group" ${cfg.source === "group" ? "selected" : ""}>A group</option>
+      <option value="all" ${cfg.source === "all" ? "selected" : ""}>All wallets</option>
+      <option value="selected" ${cfg.source === "selected" ? "selected" : ""}>Selected on Wallets page (${S.selected.size})</option></select></label>
+    ${cfg.source === "group" ? `<label>Group <select id="${prefix}-group">${options(w.groups, cfg.group, (g) => `${g.name} (${g.size})`, (g) => g.name)}</select></label>` : ""}`;
+}
+function sourceSelection(cfg) {
+  if (cfg.source === "group") return { group: cfg.group };
+  if (cfg.source === "selected") return { addresses: [...S.selected] };
+  return {};
+}
+function assetSelect(id, value, w) {
+  return `<select id="${id}"><option value="native">${esc(symbol(S.chainId))} (native)</option>${options(w.tokens, value, (x) => x.symbol, (x) => x.address)}</select>`;
+}
+
+async function tabNfts(w, book) {
+  const n = S.tx.nft;
+  const cols = (await api("/api/collections")).collections.filter((c) => c.chain_id === S.chainId);
+  const d = n.data;
+  $("#tx-body").innerHTML = `<div class="panel">
+    <div class="row">
+      <label>Collection <select id="n-col"><option value="">— choose —</option>${options(cols, n.contract, (c) => c.slug, (c) => c.address)}</select></label>
+      <label style="flex:1 1 300px">or contract address<input id="n-contract" class="mono" value="${esc(n.contract)}" placeholder="0x…"></label>
+      <button class="primary" data-action="nft-load">Load</button>
+    </div>
+    ${d ? `<div class="row" style="margin-top:10px">
+      <span class="badge info">${esc(d.standard.toUpperCase())}</span><span class="muted">${d.holdings.length} NFT${d.holdings.length === 1 ? "" : "s"} known in your wallets</span><span class="spacer"></span>
+      <label>Look-back blocks (0 = skip history scan)<input id="n-lookback" type="number" min="0" value="0" style="width:130px"></label>
+      <button data-action="nft-discover">Find my NFTs</button><button data-action="nft-manual">Add token IDs</button></div>
+      <p class="tiny muted">“Find my NFTs” checks your mint records and the contract's own token list, and with a look-back it also scans transfer history. Every NFT is checked on-chain before it's shown.</p>` : ""}
+  </div>
+  ${d ? `<div class="panel">
+    ${d.holdings.length ? `<div class="table-wrap"><table>
+      <tr><th><input type="checkbox" id="n-all" ${d.holdings.length && d.holdings.every((h) => n.picked.has(nftKey(h))) ? "checked" : ""}></th><th>Wallet</th><th>Token ID</th><th class="num">Held</th>${d.standard === "erc1155" ? `<th class="num">Send</th>` : ""}<th>Found by</th></tr>
+      ${d.holdings.map((h) => `<tr><td><input type="checkbox" data-nft="${esc(nftKey(h))}" ${n.picked.has(nftKey(h)) ? "checked" : ""}></td>
+        <td>${addr(h.owner, h.label)}</td><td class="mono">${esc(h.token_id)}</td><td class="num">${esc(h.amount)}</td>
+        ${d.standard === "erc1155" ? `<td class="num"><input data-amount="${esc(nftKey(h))}" type="number" min="1" max="${esc(h.amount)}" value="${esc(h.amount)}" style="width:80px"></td>` : ""}
+        <td class="tiny">${esc(h.source)}</td></tr>`).join("")}</table></div>` : `<div class="empty">No NFTs found yet. Use “Find my NFTs”.</div>`}
+    <div class="row" style="margin-top:12px">
+      <label>Mode <select id="n-mode"><option value="consolidate" ${n.mode === "consolidate" ? "selected" : ""}>Consolidate — all into one wallet</option>
+        <option value="distribute" ${n.mode === "distribute" ? "selected" : ""}>Distribute — spread to recipients</option></select></label>
+      ${n.mode === "consolidate" ? `<label>Send to <select id="n-dest">${destinationOptions(w, book, n.dest)}</select></label>`
+        : `<label>Saved list <select id="n-list"><option value="">— type below —</option>${options(book.lists, "", (l) => `${l.name} (${l.rows.length})`, (l) => l.name)}</select></label>`}
+      <button class="primary" data-action="nft-preview">Preview ${n.picked.size} NFT${n.picked.size === 1 ? "" : "s"}</button>
+    </div>
+    ${n.mode === "distribute" ? `<label style="margin-top:8px">Recipients — one address per line (NFTs are dealt out in order). Or CSV with <span class="mono">address,token_id</span> to give each NFT its own recipient.<textarea id="n-recipients" rows="5" spellcheck="false">${esc(n.recipients || "")}</textarea></label>` : ""}
+  </div>` : ""}`;
+  $("#n-col").onchange = (e) => { $("#n-contract").value = e.target.value; };
+  if ($("#n-all")) $("#n-all").onchange = (e) => { d.holdings.forEach((h) => (e.target.checked ? n.picked.add(nftKey(h)) : n.picked.delete(nftKey(h)))); render(); };
+  $$("[data-nft]").forEach((cb) => (cb.onchange = (e) => { e.target.checked ? n.picked.add(cb.dataset.nft) : n.picked.delete(cb.dataset.nft); readNftForm(); render(); }));
+  if ($("#n-mode")) $("#n-mode").onchange = (e) => { readNftForm(); n.mode = e.target.value; render(); };
+}
+const nftKey = (h) => `${h.owner}:${h.token_id}`;
+function readNftForm() {
+  const n = S.tx.nft;
+  if ($("#n-dest")) n.dest = $("#n-dest").value;
+  if ($("#n-recipients")) n.recipients = $("#n-recipients").value;
+  n.amounts = n.amounts || {};
+  $$("[data-amount]").forEach((i) => { n.amounts[i.dataset.amount] = i.value; });
+}
+
+async function tabSweep(w, book) {
+  const c = S.tx.sweep;
+  if (c.source === "group" && !c.group && w.groups.length) c.group = w.groups[0].name;
+  $("#tx-body").innerHTML = `<div class="panel">
+    <p class="muted">Collect funds from many wallets into one. Destinations must be your own wallet or in the address book.</p>
+    <div class="row">
+      <label>Asset ${assetSelect("s-asset", c.asset, w)}</label>
+      ${sourceControls("s", c, w)}
+      <label>Send to <select id="s-dest">${destinationOptions(w, book, c.dest)}</select></label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>Leave in each wallet (${esc(symbol(S.chainId))} gas reserve)<input id="s-reserve" value="${esc(c.reserve)}" style="width:120px"></label>
+      <label>Skip wallets below<input id="s-min" value="${esc(c.min_balance)}" style="width:110px"></label>
+      <label>Max moved this time (${esc(symbol(S.chainId))}, optional)<input id="s-cap" value="${esc(c.cap || "")}" style="width:130px" placeholder="from Settings"></label>
+      <button class="primary" data-action="sweep-preview">Preview sweep</button>
+    </div>
+    <p class="tiny muted">Native sweeps send everything above the reserve, minus this transfer's gas. Token sweeps send each wallet's full token balance (gas is paid in ${esc(symbol(S.chainId))}).</p>
+  </div>`;
+  $("#s-source").onchange = (e) => { readSweep(); c.source = e.target.value; render(); };
+}
+function readSweep() {
+  const c = S.tx.sweep, v = (id) => ($(id) ? $(id).value : undefined);
+  c.asset = v("#s-asset") ?? c.asset; c.dest = v("#s-dest") ?? c.dest; c.group = v("#s-group") ?? c.group;
+  c.reserve = v("#s-reserve") ?? c.reserve; c.min_balance = v("#s-min") ?? c.min_balance; c.cap = v("#s-cap") ?? c.cap;
+}
+
+async function tabDistribute(w, book) {
+  const c = S.tx.dist;
+  const keyed = w.wallets.filter((x) => x.has_key);
+  const modes = [["equal_each", "Same amount to each"], ["equal_split", "Split a total equally"], ["percent", "Split a total by percent"], ["custom", "Custom amount each"], ["pairs", "Many-to-many (from a list)"]];
+  const help = {
+    equal_each: "One address per line.", equal_split: "One address per line.",
+    percent: "CSV: address,percent — percentages must add up to 100.", custom: "CSV: address,amount",
+    pairs: "CSV: source,address,amount — source must be one of your wallets.",
+  }[c.mode];
+  $("#tx-body").innerHTML = `<div class="panel">
+    <div class="row">
+      <label>Asset ${assetSelect("d-asset", c.asset, w)}</label>
+      <label>How <select id="d-mode">${options(modes, c.mode, (m) => m[1], (m) => m[0])}</select></label>
+      ${c.mode !== "pairs" ? `<label>Paid from <select id="d-source">${options(keyed, c.source, (x) => `${x.label || short(x.address)} — ${x.native ?? "?"} ${symbol(S.chainId)}`, (x) => x.address)}</select></label>` : ""}
+      ${c.mode === "equal_each" ? `<label>Amount each<input id="d-each" value="${esc(c.each || "")}" style="width:120px"></label>` : ""}
+      ${["equal_split", "percent"].includes(c.mode) ? `<label>Total<input id="d-total" value="${esc(c.total || "")}" style="width:120px"></label>` : ""}
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>Saved list <select id="d-list"><option value="">— type below —</option>${options(book.lists, c.list || "", (l) => `${l.name} (${l.rows.length})`, (l) => l.name)}</select></label>
+      <input type="file" id="d-file" accept=".csv,text/csv">
+      <label>Max ${esc(symbol(S.chainId))} moved (optional)<input id="d-cap" value="${esc(c.cap || "")}" style="width:120px" placeholder="from Settings"></label>
+    </div>
+    <label style="margin-top:8px">Recipients — ${esc(help)}<textarea id="d-text" rows="7" spellcheck="false">${esc(c.text || "")}</textarea></label>
+    <div class="row" style="margin-top:10px"><button data-action="dist-check">Check list</button><button data-action="dist-save">Save list…</button>
+      <span class="spacer"></span><button class="primary" data-action="dist-preview">Preview distribution</button></div>
+    <div id="d-result"></div>
+  </div>`;
+  $("#d-mode").onchange = (e) => { readDist(); c.mode = e.target.value; render(); };
+}
+function readDist() {
+  const c = S.tx.dist, v = (id) => ($(id) ? $(id).value : undefined);
+  c.asset = v("#d-asset") ?? c.asset; c.source = v("#d-source") ?? c.source; c.each = v("#d-each") ?? c.each;
+  c.total = v("#d-total") ?? c.total; c.list = v("#d-list") ?? c.list; c.text = v("#d-text") ?? c.text; c.cap = v("#d-cap") ?? c.cap;
+}
+
+async function tabBook(w, book) {
+  $("#tx-body").innerHTML = `<div class="two">
+    <div class="panel"><h2>Address book</h2>
+      <p class="tiny muted">Approved destinations outside your own wallets (cold storage, exchange deposit, partner). Sweeps and NFT consolidation can only send to your wallets or these.</p>
+      <div class="row"><label style="flex:1 1 260px">Address<input id="b-addr" class="mono"></label><label>Label<input id="b-label"></label><button class="primary" data-action="book-add">Add</button></div>
+      ${book.entries.length ? `<div class="table-wrap" style="margin-top:10px"><table><tr><th>Label</th><th>Address</th><th></th></tr>
+        ${book.entries.map((e) => `<tr><td>${esc(e.label)}</td><td>${addr(e.address)}</td><td><button class="small danger" data-action="book-remove" data-address="${esc(e.address)}">Remove</button></td></tr>`).join("")}</table></div>` : `<div class="empty">No entries.</div>`}
+    </div>
+    <div class="panel"><h2>Saved recipient lists</h2>
+      <p class="tiny muted">Create lists on the Distribute tab (“Save list…”).</p>
+      ${book.lists.length ? `<div class="table-wrap"><table><tr><th>Name</th><th class="num">Recipients</th><th>Updated</th><th></th></tr>
+        ${book.lists.map((l) => `<tr><td>${esc(l.name)}</td><td class="num">${l.rows.length}</td><td class="tiny">${esc(fmtTime(l.updated_at))}</td><td><button class="small danger" data-action="list-delete" data-name="${esc(l.name)}">Delete</button></td></tr>`).join("")}</table></div>` : `<div class="empty">No saved lists.</div>`}
+    </div></div>`;
+}
+
+function txPreviewHTML(p) {
+  const t = p.totals, sym = symbol(p.chain_id);
+  return `<div class="panel">
+    <div class="row"><h2 style="margin:0">Preview — ${esc(p.title)}</h2><span class="spacer"></span><span class="muted">max fee ${esc(p.fees.max_fee_gwei)} gwei</span></div>
+    <div class="grid cards" style="margin:12px 0">
+      <div class="card"><div class="muted">Ready</div><div class="big">${t.ready} / ${t.total}</div><div class="tiny muted">${t.wallets} sending wallet${t.wallets === 1 ? "" : "s"}</div></div>
+      <div class="card"><div class="muted">${esc(sym)} moved</div><div class="big">${esc(t.native_moved)}</div><div class="tiny muted">limit ${esc(t.move_cap)}</div></div>
+      <div class="card"><div class="muted">Max gas</div><div class="big">${esc(t.max_gas)}</div><div class="tiny muted">${esc(sym)}, usually much less</div></div>
+      <div class="card"><div class="muted">Leaves your wallets</div><div class="big">${esc(t.external_spend)}</div><div class="tiny muted">${t.external_recipients} outside recipient${t.external_recipients === 1 ? "" : "s"} · 24h ${esc(t.daily_used)}/${esc(t.daily_limit)}</div></div>
+    </div>
+    ${p.blocks.map((b) => `<div class="notice bad">${esc(b)}</div>`).join("")}
+    ${p.notes.map((n) => `<div class="notice info">${esc(n)}</div>`).join("")}
+    <div class="table-wrap"><table>
+      <tr><th>From</th><th>To</th><th>Asset</th><th class="num">Amount</th><th class="num">Max gas</th><th>Status</th><th>Reason</th></tr>
+      ${p.rows.map((r) => `<tr><td>${addr(r.source)}</td><td>${addr(r.recipient)}${r.external ? ` <span class="badge warn">outside</span>` : ""}</td>
+        <td>${esc(r.asset)}</td><td class="num">${esc(r.amount)}</td><td class="num">${esc(r.max_gas_cost)}</td><td>${badge(r.status)}</td><td class="wrap">${esc(r.reason)}</td></tr>`).join("")}
+    </table></div>
+    ${p.token ? `<div class="row" style="margin-top:14px">
+      <label>Check every row above, then type ${esc(p.confirm_word)}<input id="tx-confirm" autocomplete="off" style="width:140px"></label>
+      <button class="primary" data-action="tx-start">Send ${t.ready} transaction${t.ready === 1 ? "" : "s"}</button>
+      <span class="tiny muted">Preview valid for ${countdown(p.created + p.expires_in)}. Only READY rows are sent, exactly as shown.</span></div>` : ""}
+  </div>`;
+}
+async function renderTxJobs() {
+  const el = $("#txjobs"); if (!el) return;
+  const d = await api("/api/tx/jobs");
+  el.innerHTML = `<div class="panel"><h2>Transfer operations</h2>${d.jobs.length ? d.jobs.map(txJobCard).join("") : `<div class="empty">No transfer operations yet.</div>`}</div>`;
+}
+function txJobCard(j) {
+  const done = j.runs.filter((r) => r.phase === "confirmed").length;
+  return `<div class="panel" style="padding:12px">
+    <div class="row"><b>#${j.id} ${esc(j.title)}</b> ${badge(j.status)}<span class="muted">${done}/${j.runs.length} confirmed</span></div>
+    <div class="table-wrap" style="margin-top:8px"><table>
+      <tr><th>From</th><th>To</th><th>Asset</th><th class="num">Amount</th><th>Status</th><th>Message</th><th>Transaction</th></tr>
+      ${j.runs.map((r) => `<tr><td>${addr(r.source)}</td><td>${addr(r.recipient)}</td><td>${esc(r.asset)}</td><td class="num">${esc(r.amount)}</td>
+        <td>${badge(r.phase)}</td><td class="wrap">${esc(r.message)}</td><td>${txLink(j.chain_id, r.tx_hash)}</td></tr>`).join("")}
+    </table></div></div>`;
+}
+async function showTxPreview(promise) {
+  const p = await promise;
+  p.created = Date.now() / 1000; S.tx.preview = p;
+  $("#tx-preview").innerHTML = txPreviewHTML(p);
+  $("#tx-preview").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+async function withBusy(el, label, fn) {
+  el.disabled = true; const old = el.textContent; el.textContent = label;
+  try { await fn(); } finally { el.disabled = false; el.textContent = old; }
+}
+Object.assign(ACTIONS_EXTRA, {
+  "tx-tab": (el) => { S.tx.tab = el.dataset.tab; S.tx.preview = null; render(); },
+  "nft-load": (el) => guard(() => withBusy(el, "Loading…", async () => {
+    const n = S.tx.nft; n.contract = $("#n-contract").value.trim(); n.picked.clear();
+    n.data = await api(`/api/nfts?chain_id=${S.chainId}&contract=${encodeURIComponent(n.contract)}`); render();
+  })),
+  "nft-discover": (el) => guard(() => withBusy(el, "Searching…", async () => {
+    const n = S.tx.nft;
+    const r = await api("/api/nfts/discover", { chain_id: S.chainId, contract: n.contract, lookback_blocks: Number($("#n-lookback").value || 0) });
+    toast(`Found ${r.found} NFT${r.found === 1 ? "" : "s"}${r.notes.length ? ` — ${r.notes[0]}` : ""}`);
+    n.data = await api(`/api/nfts?chain_id=${S.chainId}&contract=${encodeURIComponent(n.contract)}`); render();
+  })),
+  "nft-manual": () => modal(`<h2>Add token IDs</h2><p class="tiny muted">Token IDs separated by spaces, commas or new lines. Each is checked on-chain; only ones held by your wallets are added.</p>
+    <textarea id="n-ids" rows="5"></textarea><div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="primary" data-action="nft-manual-go">Add</button></div>`),
+  "nft-manual-go": () => guard(async () => {
+    const n = S.tx.nft;
+    const r = await api("/api/nfts/manual", { chain_id: S.chainId, contract: n.contract, ids: $("#n-ids").value });
+    closeModal(); toast(`Added ${r.added}${r.not_yours.length ? `; not in your wallets: ${r.not_yours.slice(0, 5).join(", ")}` : ""}`);
+    n.data = await api(`/api/nfts?chain_id=${S.chainId}&contract=${encodeURIComponent(n.contract)}`); render();
+  }),
+  "nft-preview": (el) => guard(() => withBusy(el, "Checking…", async () => {
+    readNftForm(); const n = S.tx.nft;
+    const holdings = n.data.holdings.filter((h) => n.picked.has(nftKey(h)));
+    if (!holdings.length) throw new ApiError("Tick the NFTs to send first.");
+    let selection = holdings.map((h) => ({ owner: h.owner, token_id: h.token_id, amount: Number((n.amounts || {})[nftKey(h)] || h.amount) }));
+    const body = { chain_id: S.chainId, contract: n.contract, mode: n.mode, destination: n.dest };
+    if (n.mode === "distribute") {
+      const listName = $("#n-list") ? $("#n-list").value : "";
+      const text = n.recipients || "";
+      if (!listName && /token_id/i.test(text.split("\n")[0])) {
+        const parsed = await api("/api/addressbook", { action: "parse_list", text });
+        if (!parsed.ok) throw new ApiError(parsed.problems.join("; "));
+        const byId = Object.fromEntries(parsed.rows.filter((r) => r.token_id).map((r) => [r.token_id, r.address]));
+        selection = selection.map((s) => ({ ...s, recipient: byId[String(s.token_id)] })).filter((s) => s.recipient);
+        body.text = parsed.rows.map((r) => r.address).join("\n");
+      } else { body.list = listName; body.text = text; }
+    }
+    await showTxPreview(api("/api/nfts/preview", { ...body, selection }));
+  })),
+  "sweep-preview": (el) => guard(() => withBusy(el, "Checking…", async () => {
+    readSweep(); const c = S.tx.sweep;
+    await showTxPreview(api("/api/sweep/preview", { chain_id: S.chainId, ...sourceSelection(c), destination: c.dest || $("#s-dest").value, asset: c.asset, reserve: c.reserve, min_balance: c.min_balance, cap: c.cap }));
+  })),
+  "dist-check": () => guard(async () => {
+    readDist();
+    const r = await api("/api/addressbook", { action: "parse_list", text: S.tx.dist.text || "" });
+    $("#d-result").innerHTML = r.ok ? `<div class="notice info">${r.rows.length} recipients look good.</div>` : r.problems.map((p) => `<div class="notice bad">${esc(p)}</div>`).join("");
+  }),
+  "dist-save": () => { readDist(); modal(`<h2>Save recipient list</h2><label>Name<input id="list-name"></label>
+    <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="primary" data-action="dist-save-go">Save</button></div>`); },
+  "dist-save-go": () => guard(async () => { await api("/api/addressbook", { action: "save_list", name: $("#list-name").value, text: S.tx.dist.text || "" }); closeModal(); toast("List saved"); render(); }),
+  "dist-preview": (el) => guard(() => withBusy(el, "Checking…", async () => {
+    readDist(); const c = S.tx.dist;
+    await showTxPreview(api("/api/distribute/preview", { chain_id: S.chainId, mode: c.mode, asset: c.asset, source: c.source || ($("#d-source") && $("#d-source").value), each: c.each, total: c.total, list: c.list, text: c.text, cap: c.cap }));
+  })),
+  "book-add": () => guard(async () => { await api("/api/addressbook", { action: "add", address: $("#b-addr").value, label: $("#b-label").value }); toast("Added"); render(); }),
+  "book-remove": (el) => guard(async () => { if (!confirm("Remove this address from the address book?")) return; await api("/api/addressbook", { action: "remove", address: el.dataset.address }); render(); }),
+  "list-delete": (el) => guard(async () => { if (!confirm(`Delete list “${el.dataset.name}”?`)) return; await api("/api/addressbook", { action: "delete_list", name: el.dataset.name }); render(); }),
+  "tx-start": (el) => guard(() => withBusy(el, "Sending…", async () => {
+    const r = await api("/api/tx/start", { token: S.tx.preview.token, confirm: $("#tx-confirm").value });
+    S.tx.preview = null; $("#tx-preview").innerHTML = ""; toast(`Operation #${r.job_id} started`); renderTxJobs();
+  })),
+});
+
+const PAGE_RENDER = { overview: renderOverview, wallets: renderWallets, collections: renderCollections, eligibility: renderEligibility, mint: renderMint, transfers: renderTransfers, history: renderHistory, networks: renderNetworks, settings: renderSettings };
 
 // ---------------------------------------------------------------- actions
 const ACTIONS = {
@@ -673,10 +957,12 @@ const ACTIONS = {
 };
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
-  if (el && ACTIONS[el.dataset.action]) { e.preventDefault(); ACTIONS[el.dataset.action](el, e); }
+  const fn = el && (ACTIONS[el.dataset.action] || ACTIONS_EXTRA[el.dataset.action]);
+  if (fn) { e.preventDefault(); fn(el, e); }
 });
 document.addEventListener("change", (e) => {
   if (e.target.id === "csv-file" && e.target.files[0]) e.target.files[0].text().then((t) => { $("#csv-text").value = t; });
+  if (e.target.id === "d-file" && e.target.files[0]) e.target.files[0].text().then((t) => { $("#d-text").value = t; S.tx.dist.text = t; });
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
 

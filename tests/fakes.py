@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass, field
 
 import httpx
+import rlp
 from eth_account import Account
 from eth_utils.crypto import keccak
 
@@ -41,6 +42,10 @@ class FakeChain:
     send_delay: float = 0.0
     next_token: int = 1
     revert: bool = False
+    erc20: dict[str, dict[str, int]] = field(default_factory=dict)      # token -> owner -> units
+    erc721: dict[str, dict[int, str]] = field(default_factory=dict)     # contract -> id -> owner
+    erc1155: dict[str, dict[tuple[str, int], int]] = field(default_factory=dict)
+    gas_price: int = 11 * 10**8
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -83,29 +88,48 @@ class FakeChain:
             raw = bytes.fromhex(params[0][2:])
             sender = Account.recover_transaction(raw).lower()
             tx_hash = "0x" + keccak(raw).hex()
-            self.nonces[sender] = self.nonces.get(sender, 0) + 1
-            self.sent.append({"from": sender, "hash": tx_hash})
-            logs = []
-            for _ in range(self.quantity):
-                logs.append({
-                    "address": NFT,
-                    "topics": ["0x" + TRANSFER.hex(), "0x" + "00" * 32,
-                               "0x" + "00" * 12 + sender[2:], "0x" + self.next_token.to_bytes(32, "big").hex()],
-                    "data": "0x", "logIndex": hex(len(logs)), "removed": False,
-                    "blockHash": "0x" + "ab" * 32, "blockNumber": "0x101",
-                    "transactionHash": tx_hash, "transactionIndex": "0x0",
-                })
-                self.next_token += 1
+            fields = rlp.decode(raw[1:])
+            nonce = int.from_bytes(fields[1], "big")
+            to = "0x" + fields[5].hex()
+            value = int.from_bytes(fields[6], "big")
+            data = bytes(fields[7])
+            if nonce != self.nonces.get(sender, 0):
+                raise ValueError(f"nonce too low/high: got {nonce}, want {self.nonces.get(sender, 0)}")
+            if self.balances.get(sender, 0) < value:
+                raise ValueError("insufficient funds for gas * price + value")
+            self.nonces[sender] = nonce + 1
+            self.sent.append({"from": sender, "hash": tx_hash, "to": to, "value": value, "data": data})
+            if to.lower() == OPENSEA_SEADROP_ADDRESS.lower():
+                return self._mint_receipt(sender, tx_hash)
+            ok = self._apply(sender, to, value, data)
+            gas_used = 21_000 if not data else 60_000
+            if ok:
+                self.balances[sender] = self.balances.get(sender, 0) - value - gas_used * self.gas_price
+            else:
+                self.balances[sender] = self.balances.get(sender, 0) - gas_used * self.gas_price
             self.receipts[tx_hash] = {
                 "transactionHash": tx_hash, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x101",
-                "status": "0x0" if self.revert else "0x1", "logs": [] if self.revert else logs,
-                "gasUsed": hex(150_000), "effectiveGasPrice": hex(11 * 10**8),
-            }
+                "status": "0x1" if ok else "0x0", "logs": [], "gasUsed": hex(gas_used),
+                "effectiveGasPrice": hex(self.gas_price)}
             return tx_hash
         if method == "eth_getTransactionReceipt":
             return self.receipts.get(params[0])
-        if method in ("eth_call", "eth_estimateGas"):
-            raise ValueError("not supported by fake chain")
+        if method == "eth_call":
+            return self._call(params[0])
+        if method == "eth_estimateGas":
+            call = params[0]
+            sender = call.get("from", "").lower()
+            data = bytes.fromhex(call.get("data", "0x")[2:])
+            value = int(call.get("value", "0x0"), 16)
+            if call["to"].lower() == OPENSEA_SEADROP_ADDRESS.lower():
+                raise ValueError("not supported by fake chain")
+            if self.balances.get(sender, 0) < value:
+                raise ValueError("insufficient funds for transfer")
+            if data and not self._apply(sender, call["to"].lower(), value, data, dry=True):
+                raise ValueError("execution reverted")
+            return hex(21_000 if not data else 60_000)
+        if method == "eth_getLogs":
+            return []
         raise ValueError(f"unexpected method {method}")
 
 
@@ -171,3 +195,117 @@ class FakeOpenSea:
 
     async def aclose(self) -> None:
         return None
+
+
+def _addr(word: bytes) -> str:
+    return "0x" + word[12:32].hex()
+
+
+def _u(word: bytes) -> int:
+    return int.from_bytes(word[:32], "big")
+
+
+def _call_impl(self: FakeChain, call: dict) -> str:
+    to = call["to"].lower()
+    data = bytes.fromhex(call.get("data", call.get("input", "0x"))[2:])
+    sel, args = data[:4].hex(), data[4:]
+    word = lambda n: args[32 * n: 32 * n + 32]
+    if sel == "01ffc9a7":  # supportsInterface
+        iface = args[:4].hex()
+        is721, is1155 = to in self.erc721, to in self.erc1155
+        return "0x" + (1 if (iface == "80ac58cd" and is721) or (iface == "d9b67a26" and is1155)
+                       else 0).to_bytes(32, "big").hex()
+    if sel == "70a08231":  # balanceOf(address) — ERC-20 or ERC-721
+        owner = _addr(word(0))
+        if to in self.erc20:
+            return "0x" + self.erc20[to].get(owner, 0).to_bytes(32, "big").hex()
+        count = sum(1 for o in self.erc721.get(to, {}).values() if o == owner)
+        return "0x" + count.to_bytes(32, "big").hex()
+    if sel == "6352211e":  # ownerOf
+        owner = self.erc721.get(to, {}).get(_u(word(0)))
+        if owner is None:
+            raise ValueError("execution reverted: nonexistent token")
+        return "0x" + "00" * 12 + owner[2:]
+    if sel == "2f745c59":  # tokenOfOwnerByIndex
+        owner, index = _addr(word(0)), _u(word(1))
+        ids = sorted(i for i, o in self.erc721.get(to, {}).items() if o == owner)
+        if index >= len(ids):
+            raise ValueError("execution reverted")
+        return "0x" + ids[index].to_bytes(32, "big").hex()
+    if sel == "00fdd58e":  # balanceOf(address,uint256)
+        return "0x" + self.erc1155.get(to, {}).get((_addr(word(0)), _u(word(1))), 0).to_bytes(32, "big").hex()
+    if sel == "313ce567":
+        return "0x" + (6).to_bytes(32, "big").hex()
+    if sel == "95d89b41":
+        from eth_abi import encode
+        return "0x" + encode(["string"], ["USDX"]).hex()
+    raise ValueError("execution reverted: unknown call")
+
+
+def _apply_impl(self: FakeChain, sender: str, to: str, value: int, data: bytes, dry: bool = False) -> bool:
+    from eth_abi import decode
+    to = to.lower()
+    if not data:
+        if not dry:
+            self.balances[to] = self.balances.get(to, 0) + value
+        return True
+    sel, args = data[:4].hex(), data[4:]
+    if sel == "a9059cbb" and to in self.erc20:
+        recipient, amount = decode(["address", "uint256"], args)
+        book = self.erc20[to]
+        if book.get(sender, 0) < amount:
+            return False
+        if not dry:
+            book[sender] -= amount
+            book[recipient.lower()] = book.get(recipient.lower(), 0) + amount
+        return True
+    if sel == "42842e0e" and to in self.erc721:
+        frm, recipient, token_id = decode(["address", "address", "uint256"], args)
+        owners = self.erc721[to]
+        if owners.get(token_id) != sender or frm.lower() != sender:
+            return False
+        if not dry:
+            owners[token_id] = recipient.lower()
+        return True
+    if sel in ("f242432a", "2eb2c2d6") and to in self.erc1155:
+        if sel == "f242432a":
+            frm, recipient, token_id, amount, _ = decode(["address", "address", "uint256", "uint256", "bytes"], args)
+            moves = [(token_id, amount)]
+        else:
+            frm, recipient, ids, amounts, _ = decode(["address", "address", "uint256[]", "uint256[]", "bytes"], args)
+            moves = list(zip(ids, amounts))
+        book = self.erc1155[to]
+        if frm.lower() != sender or any(book.get((sender, i), 0) < a for i, a in moves):
+            return False
+        if not dry:
+            for i, a in moves:
+                book[(sender, i)] -= a
+                book[(recipient.lower(), i)] = book.get((recipient.lower(), i), 0) + a
+        return True
+    return False
+
+
+def _mint_receipt_impl(self: FakeChain, sender: str, tx_hash: str) -> str:
+    logs = []
+    for _ in range(self.quantity):
+        logs.append({
+            "address": NFT,
+            "topics": ["0x" + TRANSFER.hex(), "0x" + "00" * 32,
+                       "0x" + "00" * 12 + sender[2:], "0x" + self.next_token.to_bytes(32, "big").hex()],
+            "data": "0x", "logIndex": hex(len(logs)), "removed": False,
+            "blockHash": "0x" + "ab" * 32, "blockNumber": "0x101",
+            "transactionHash": tx_hash, "transactionIndex": "0x0",
+        })
+        self.erc721.setdefault(NFT.lower(), {})[self.next_token] = sender
+        self.next_token += 1
+    self.receipts[tx_hash] = {
+        "transactionHash": tx_hash, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x101",
+        "status": "0x0" if self.revert else "0x1", "logs": [] if self.revert else logs,
+        "gasUsed": hex(150_000), "effectiveGasPrice": hex(self.gas_price),
+    }
+    return tx_hash
+
+
+FakeChain._call = _call_impl
+FakeChain._apply = _apply_impl
+FakeChain._mint_receipt = _mint_receipt_impl

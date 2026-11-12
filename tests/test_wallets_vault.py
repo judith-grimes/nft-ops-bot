@@ -50,7 +50,7 @@ def test_tampered_vault_entry_is_detected(env):
 def test_groups_and_selection(env):
     a = env.wallets.generate(3, group="fcfs")
     env.wallets.add_to_group(a[:1], "wl")
-    assert env.wallets.resolve_selection(group="fcfs", exclude=[a[1]]) == [a[0], a[2]]
+    assert env.wallets.resolve_selection(group="fcfs", exclude=[a[1]]) == sorted([a[0], a[2]])
     assert env.wallets.resolve_selection(group="wl") == [a[0]]
     env.wallets.rename_group("wl", "whitelist")
     assert {g["name"]: g["size"] for g in env.wallets.groups()} == {"fcfs": 3, "whitelist": 1}

@@ -8,6 +8,7 @@ allowlist of a fake drop whose allowlist phase opens 90 seconds after start.
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import time
@@ -47,7 +48,8 @@ def main() -> None:
             env.chain.balances[params[0].lower()] = 10**18
         return await original(method, params)
     env.chain._dispatch = rich
-    metadata = allowlist_metadata(time.time() + 90, time.time() + 3600)
+    delay = float(os.environ.get("DEMO_START_DELAY", "90"))
+    metadata = allowlist_metadata(time.time() + delay, time.time() + 3600)
     holder: dict = {}
     state = AppState(tmp / "data", opensea_factory=lambda: DemoOpenSea(metadata, holder["s"]),
                      pool=env.pool, gateway_factory=env.gateway_factory())

@@ -24,19 +24,22 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 
 from osnm_z.opensea_protocol import ProtocolError
 
-from . import __version__, balances, collections, eligibility
+from . import __version__, addressbook, balances, collections, eligibility, nfts, transfers
 from .balances import format_units
 from .collections import CollectionError, OpenSeaFactory, default_opensea_factory
 from .db import Database
 from .events import EventBus
 from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
 from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
+from .nfts import NftError
 from .safety import LIMIT_LABELS, Safety, from_wei
+from .txengine import TxEngine, TxEngineError
 from .vault import Vault, VaultError
 from .wallets import WalletError, WalletService, checksum, safe_cell
 
 STATIC = Path(__file__).parent / "static"
-USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, RpcError, ValueError,
+USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
+               RpcError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
 
@@ -57,6 +60,10 @@ class AppState:
         self.sessions: set[str] = set()
         self.scan_task: asyncio.Task | None = None
         self.scan_progress: dict[str, Any] = {}
+        self.tx = TxEngine(self.db, self.vault, self.pool, self.bus, self.safety)
+        # A wallet can be in a mint or a transfer operation, never both (nonce safety).
+        self.tx.external_busy = self.mint.active_wallets.get
+        self.mint.external_busy = self.tx.busy_sources.get
 
 
 def create_app(state: AppState, port: int) -> FastAPI:
@@ -155,7 +162,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
 
     @app.post("/api/vault/lock")
     async def vault_lock() -> dict:
-        if state.mint.active_wallets:
+        if state.mint.active_wallets or state.tx.busy_sources:
             raise ValueError("an operation is running; stop it or wait before locking")
         state.vault.lock()
         state.sessions.clear()
@@ -199,6 +206,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
             "wallets": wallets["n"] or 0, "with_keys": wallets["k"] or 0, "totals": totals,
             "eligible_wallets": eligible, "last24h": counts, "upcoming": upcoming[:10],
             "active_jobs": [j for j in state.mint.list_jobs() if j["status"] == "running"],
+            "active_tx_jobs": [j for j in state.tx.list_jobs() if j["status"] == "running"],
             "recent": db.all("SELECT * FROM history ORDER BY id DESC LIMIT 10"),
             "stopped": state.safety.stopped, "now": now,
         }
@@ -246,7 +254,8 @@ def create_app(state: AppState, port: int) -> FastAPI:
         data = await body(request)
         if str(data.get("confirm", "")).strip().upper() != "REMOVE":
             raise ValueError("type REMOVE to confirm; removed keys are deleted from the vault")
-        busy = [a for a in data.get("addresses", []) if checksum(a) in state.mint.active_wallets]
+        busy = [a for a in data.get("addresses", []) if checksum(a) in state.mint.active_wallets
+                or checksum(a) in state.tx.busy_sources]
         if busy:
             raise ValueError(f"{busy[0]} is in a running operation")
         return ok(removed=state.wallets.remove(list(data.get("addresses", []))))
@@ -476,6 +485,121 @@ def create_app(state: AppState, port: int) -> FastAPI:
                                                  "spacing_seconds": spacing})
         return ok()
 
+    # ----- address book & recipient lists ----------------------------------------------
+    @app.get("/api/addressbook")
+    async def addressbook_list() -> dict:
+        return {"entries": addressbook.entries(state.db), "lists": addressbook.lists(state.db)}
+
+    @app.post("/api/addressbook")
+    async def addressbook_action(request: Request) -> dict:
+        data = await body(request)
+        action = data.get("action")
+        if action == "add":
+            addressbook.add(state.db, str(data["address"]), str(data.get("label", "")))
+        elif action == "remove":
+            addressbook.remove(state.db, str(data["address"]))
+        elif action == "parse_list":
+            return addressbook.parse_recipients(str(data.get("text", "")))
+        elif action == "save_list":
+            parsed = addressbook.parse_recipients(str(data.get("text", "")))
+            if not parsed["ok"]:
+                raise ValueError("; ".join(parsed["problems"][:5]) or "list is empty")
+            addressbook.save_list(state.db, str(data.get("name", "")), parsed["rows"])
+        elif action == "delete_list":
+            addressbook.delete_list(state.db, str(data["name"]))
+        else:
+            raise ValueError("unknown address book action")
+        return ok(entries=addressbook.entries(state.db), lists=addressbook.lists(state.db))
+
+    # ----- transfers: sweep, distribute, NFTs --------------------------------------------
+    def recipients_from(data: dict) -> list[dict]:
+        if data.get("list"):
+            match = [x for x in addressbook.lists(state.db) if x["name"] == data["list"]]
+            if not match:
+                raise ValueError("saved list not found")
+            return match[0]["rows"]
+        parsed = addressbook.parse_recipients(str(data.get("text", "")))
+        if not parsed["ok"]:
+            raise ValueError("; ".join(parsed["problems"][:5]) or "add recipients")
+        return parsed["rows"]
+
+    @app.post("/api/sweep/preview")
+    async def sweep_preview(request: Request) -> dict:
+        data = await body(request)
+        chain_id = int(data["chain_id"])
+        items, notes = await transfers.plan_sweep(
+            state.db, state.pool, chain_id, selection(data), str(data["destination"]),
+            str(data.get("asset") or "native"), str(data.get("reserve") or "0"),
+            str(data.get("min_balance") or "0"))
+        return await state.tx.preview("sweep", chain_id, items, "Sweep", str(data.get("cap") or ""),
+                                      notes)
+
+    @app.post("/api/distribute/preview")
+    async def distribute_preview(request: Request) -> dict:
+        data = await body(request)
+        chain_id = int(data["chain_id"])
+        mode = str(data.get("mode", "equal_each"))
+        items, notes = await transfers.plan_distribute(
+            state.db, state.pool, chain_id, mode, str(data.get("asset") or "native"),
+            recipients_from(data), data.get("source") or None, str(data.get("total") or ""),
+            str(data.get("each") or ""))
+        return await state.tx.preview("distribute", chain_id, items, "Distribution",
+                                      str(data.get("cap") or ""), notes)
+
+    @app.get("/api/nfts")
+    async def nfts_list(chain_id: int, contract: str) -> dict:
+        contract = checksum(contract)
+        standard = await nfts.detect_standard(state.pool, chain_id, contract)
+        return {"contract": contract, "standard": standard,
+                "holdings": nfts.holdings(state.db, chain_id, contract)}
+
+    @app.post("/api/nfts/discover")
+    async def nfts_discover(request: Request) -> dict:
+        data = await body(request)
+        chain_id, contract = int(data["chain_id"]), checksum(str(data["contract"]))
+        standard = await nfts.detect_standard(state.pool, chain_id, contract)
+        lookback = int(data.get("lookback_blocks") or 0)
+        if not 0 <= lookback <= 50_000_000:
+            raise ValueError("look-back must be 0-50,000,000 blocks")
+        return ok(**await nfts.discover(state.db, state.pool, chain_id, contract, standard,
+                                        selection(data), lookback))
+
+    @app.post("/api/nfts/manual")
+    async def nfts_manual(request: Request) -> dict:
+        data = await body(request)
+        chain_id, contract = int(data["chain_id"]), checksum(str(data["contract"]))
+        standard = await nfts.detect_standard(state.pool, chain_id, contract)
+        ids = [int(x) for x in str(data.get("ids", "")).replace(",", " ").split() if x.strip()]
+        if not ids or len(ids) > 1000:
+            raise ValueError("enter 1-1000 token IDs")
+        mine = {r["address"].lower() for r in state.db.all("SELECT address FROM wallets")}
+        return ok(**await nfts.add_manual(state.db, state.pool, chain_id, contract, standard,
+                                          ids, mine))
+
+    @app.post("/api/nfts/preview")
+    async def nfts_preview(request: Request) -> dict:
+        data = await body(request)
+        chain_id, contract = int(data["chain_id"]), checksum(str(data["contract"]))
+        standard = await nfts.detect_standard(state.pool, chain_id, contract)
+        mode = str(data.get("mode", "consolidate"))
+        recipients = []
+        if mode == "distribute":
+            recipients = [r["address"] for r in recipients_from(data)]
+        items, notes = await transfers.plan_nft(
+            state.db, state.pool, chain_id, contract, standard, list(data.get("selection", [])),
+            mode, str(data.get("destination") or ""), recipients)
+        return await state.tx.preview("nft_transfer", chain_id, items, "NFT transfer", "", notes)
+
+    @app.post("/api/tx/start")
+    async def tx_start(request: Request) -> dict:
+        data = await body(request)
+        return ok(job_id=await state.tx.start(str(data.get("token", "")),
+                                              str(data.get("confirm", ""))))
+
+    @app.get("/api/tx/jobs")
+    async def tx_jobs() -> dict:
+        return {"jobs": state.tx.list_jobs()}
+
     # ----- history ---------------------------------------------------------------------
     @app.get("/api/history")
     async def history(limit: int = 200) -> dict:
@@ -489,8 +613,9 @@ def create_app(state: AppState, port: int) -> FastAPI:
     async def history_csv() -> PlainTextResponse:
         rows = state.db.all("SELECT * FROM history ORDER BY id")
         cols = ["created_at", "updated_at", "job_id", "operation", "chain_id", "address", "slug",
-                "stage_name", "quantity", "tx_hash", "nonce", "value_wei", "max_cost_wei",
-                "gas_used", "gas_cost_wei", "status", "error", "recipient"]
+                "stage_name", "quantity", "asset", "token_id", "amount", "tx_hash", "nonce",
+                "value_wei", "spend_wei", "max_cost_wei", "gas_used", "gas_cost_wei", "status",
+                "error", "recipient"]
         for r in rows:
             for key in ("created_at", "updated_at"):
                 r[key] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r[key])) + " UTC"

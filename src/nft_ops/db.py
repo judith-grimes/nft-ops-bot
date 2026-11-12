@@ -117,6 +117,27 @@ CREATE TABLE IF NOT EXISTS history (
 );
 CREATE INDEX IF NOT EXISTS history_created ON history(created_at);
 CREATE INDEX IF NOT EXISTS history_job ON history(job_id);
+CREATE TABLE IF NOT EXISTS address_book (
+    address     TEXT PRIMARY KEY,
+    label       TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recipient_lists (
+    name        TEXT PRIMARY KEY,
+    rows        TEXT NOT NULL,          -- JSON [{address, amount?, percent?, label?}]
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS nft_tokens (
+    chain_id    INTEGER NOT NULL,
+    contract    TEXT NOT NULL,
+    token_id    TEXT NOT NULL,          -- decimal string
+    owner       TEXT NOT NULL,
+    standard    TEXT NOT NULL,          -- erc721 | erc1155
+    amount      TEXT NOT NULL DEFAULT '1',
+    source      TEXT NOT NULL,          -- mint | enumerable | logs | manual
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (chain_id, contract, token_id, owner)
+);
 CREATE TABLE IF NOT EXISTS settings (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -134,6 +155,14 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after Stage 1 to existing databases."""
+        have = {r[1] for r in self._conn.execute("PRAGMA table_info(history)").fetchall()}
+        for column in ("asset TEXT", "token_id TEXT", "amount TEXT", "spend_wei TEXT"):
+            if column.split()[0] not in have:
+                self._conn.execute(f"ALTER TABLE history ADD COLUMN {column}")
 
     def close(self) -> None:
         self._conn.close()

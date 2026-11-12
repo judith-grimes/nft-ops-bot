@@ -11,10 +11,10 @@ import time
 
 import pytest
 from fakes import PRICE, FakeOpenSea, allowlist_metadata
-from osnm_z.phase_selection import stage_window
 
 from nft_ops import eligibility
 from nft_ops.mint import MintEngine, MintEngineError, MintParams
+from osnm_z.phase_selection import stage_window
 
 ETH = 10**18
 

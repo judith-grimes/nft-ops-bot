@@ -31,6 +31,7 @@ from osnm_z.execution import MintExecutionContext, execute_mint_phase
 from osnm_z.fee import configured_fee_estimate, initial_transaction_fees
 from osnm_z.hooks import LOG_SINK, PRE_BROADCAST_GATE, PreBroadcastCheck
 from osnm_z.launch_timing import ensure_mint_not_expired, is_future_phase
+from osnm_z.nft import extract_minted_assets
 from osnm_z.opensea_protocol import CollectionMetadata, ProtocolError, StageMetadata
 from osnm_z.outcomes import ExecutionState
 from osnm_z.phase_selection import (
@@ -49,7 +50,7 @@ from osnm_z.public_mint import (
 from osnm_z.rpc_protocol import ChainError
 from osnm_z.scheduling import SystemUtcClock
 
-from . import collections
+from . import collections, nfts
 from .collections import OpenSeaFactory
 from .db import Database
 from .events import EventBus
@@ -190,6 +191,7 @@ class MintEngine:
         self.jobs: dict[int, MintJob] = {}
         self.previews: dict[str, Preview] = {}
         self.active_wallets: dict[str, int] = {}
+        self.external_busy = lambda address: None   # set by the app: is it in a transfer?
         self._pending_trackers: set[asyncio.Task] = set()
         safety.on_stop(self._cancel_pre_broadcast)
 
@@ -309,6 +311,8 @@ class MintEngine:
             return "NO_KEY", "watch-only wallet; import its key to mint"
         if address in self.active_wallets:
             return "ALREADY_RUNNING", f"already in operation #{self.active_wallets[address]}"
+        if self.external_busy(address) is not None:
+            return "ALREADY_RUNNING", f"busy in transfer operation #{self.external_busy(address)}"
         if ended:
             return "PHASE_NOT_ACTIVE", "phase has ended"
         if not is_public and (metadata.is_minted_out or metadata.is_disabled):
@@ -387,7 +391,8 @@ class MintEngine:
         with self.safety.lock:
             if self.safety.stopped:
                 raise MintEngineError("emergency STOP is active")
-            busy = [a for a in preview.ready if a in self.active_wallets]
+            busy = [a for a in preview.ready if a in self.active_wallets
+                    or self.external_busy(a) is not None]
             if busy:
                 raise MintEngineError(f"{busy[0]} is already running in another operation")
             cur = self.db.execute(
@@ -498,6 +503,7 @@ class MintEngine:
                 is_scheduled=is_future_phase(phase.starts_at, clock), quantity=params.quantity,
                 gas_limit=params.gas_limit, public_mint_target=public_target, system_clock=clock))
             if result.state is ExecutionState.COMPLETED:
+                self._record_minted(metadata, run.address, params.quantity, result.receipt)
                 gas_cost, gas_used = await self._receipt_cost(chain.chain_id, run.tx_hash)
                 self._finish(run, "confirmed", "minted", gas_used=gas_used, gas_cost_wei=gas_cost)
             else:
@@ -520,6 +526,15 @@ class MintEngine:
                 self._finish(run, "not_submitted", str(error)[:300])
         finally:
             await client.aclose()
+
+    def _record_minted(self, metadata: CollectionMetadata, wallet: str, quantity: int,
+                       receipt: Any) -> None:
+        """Remember minted token IDs so the NFT transfer page can list them."""
+        try:
+            ids = extract_minted_assets(receipt, metadata.address, wallet, quantity)
+        except Exception:  # noqa: BLE001 - bookkeeping must never fail a confirmed mint
+            return
+        nfts.record_mint(self.db, metadata.network_id, metadata.address, wallet, ids)
 
     def _set_phase(self, run: WalletRun, phase: str, message: str) -> None:
         if run.phase in PRE_BROADCAST and phase in PRE_BROADCAST:
