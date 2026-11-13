@@ -197,6 +197,43 @@ transaction. Add a second RPC link for each network you mint on (**Networks → 
   the Contracts page. Fill bundled inputs as a JSON list; `{wallet}`, `{quantity}`, `{proof}`,
   `{price_wei}` and `{native}` placeholders work inside it.
 
+## Scheduled mints and notifications (Stage 6)
+
+Set a mint up once and let NFT Ops watch it. Open **Scheduled → Schedule a mint** (or, on the
+Mint page, click **Preview** and then **Schedule instead**). Choose the collection, phase, wallets,
+quantity, a **maximum total spend** and a mode:
+
+| Mode | What it does |
+|------|--------------|
+| **Monitor only** | Checks readiness and reports. Never sends a transaction. |
+| **Notify & confirm** | Prepares everything, notifies you, and mints only after you click **Mint now**. |
+| **Automatic mint** | Mints by itself when the phase opens, within your maximum spend. |
+
+- Tasks are saved in the database and survive restarts and page refreshes.
+- About 30 minutes before the start, the bot checks eligibility for the task's own wallets and
+  every wallet's readiness (balance, gas, allocation, limits).
+- At run time it checks everything again before sending, and the normal spending limits and
+  STOP always apply. A task can never run twice.
+- If the official phase time changes, the task pauses and asks you to confirm (**Resume**).
+- If NFT Ops was closed or the PC was off when a task was due, it is marked **Missed** with the
+  reason. Nothing is sent late without you.
+- Keep NFT Ops running and unlocked while an automatic task is waiting; the vault does not
+  auto-lock then.
+- Every task ends with a **report**: per wallet, what happened and why, transaction links,
+  NFTs minted, spend and gas.
+
+The bell opens the **Notifications** page: mint results, scheduled task events, wallets that
+need attention, interrupted operations and collection alerts, grouped by category, with
+read/unread and **Open** links. Choose which categories also pop up on your desktop.
+
+After a restart, operations that were running are marked **interrupted**. Wallets that had not
+sent anything are recorded as "not sent". Transactions that were already sent are checked
+on-chain until they confirm or fail.
+
+Sending is click-to-confirm: **Mint now** and **Send** show a summary dialog instead of asking
+you to type a word. Giving a marketplace permission over your NFTs (approval) and arming
+FULL AUTO offers still ask you to type a word on purpose.
+
 ## Offer Manager (auto-accept) and Portfolio
 
 Needs an **OpenSea API key** (Settings → OpenSea & offers; stored encrypted in your vault).

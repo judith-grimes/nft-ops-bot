@@ -261,7 +261,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
 
     @app.get("/static/{name}")
     async def static(name: str) -> FileResponse:
-        if name not in {"app.js", "style.css", "icon.svg"}:
+        if name not in {"app.js", "stage6.js", "style.css", "icon.svg"}:
             raise KeyError("not found")
         return FileResponse(STATIC / name)
 

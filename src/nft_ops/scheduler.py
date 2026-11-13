@@ -22,6 +22,7 @@ Safety rules:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -92,6 +93,7 @@ class Scheduler:
         self.resolve = resolve          # task -> wallet addresses
         self.rescan = rescan            # (slug, addresses) -> eligibility scan
         self.clock = clock
+        self._lock: asyncio.Lock | None = None     # one readiness check / execution at a time
 
     # ===== create / edit =================================================================
     def create(self, data: dict) -> int:
@@ -291,8 +293,17 @@ class Scheduler:
                 self._complete(task)
 
     # ===== steps =========================================================================
+    def _serial(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
     async def precheck(self, tid: int) -> dict:
         """Readiness check ahead of time (also the 'Check now' button)."""
+        async with self._serial():
+            return await self._precheck(tid)
+
+    async def _precheck(self, tid: int) -> dict:
         task = self._get(tid)
         addresses = await self._ensure_eligibility(task)
         preview = await self.mint.preview(self._params(task, addresses))

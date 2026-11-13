@@ -1,7 +1,7 @@
 =====================================================================
   PANDUAN LANJUTAN - NFT OPS BOT
   (cadangan sesi kerja + cara melanjutkan di sesi berikutnya)
-  Dibuat: 13 November 2026
+  Dibuat: 13 November 2026 (diperbarui setelah Stage 6)
 =====================================================================
 
 Baca dari atas ke bawah. Setiap langkah ditulis apa adanya, cukup
@@ -19,18 +19,20 @@ walaupun sesi Claude ini berakhir.
 
 Cabang (branch) yang penting:
 
-  main            = versi stabil (Stage 1 sampai Stage 4 + UI neon)
-  stage-5-offers  = versi TERBARU, belum digabung ke main. Isinya:
-                    - Stage 5: Offer Manager (auto-accept) + Portfolio
-                    - Perbaikan error 429 saat cek eligibility
-                    - Perbaikan wallet yang akun OpenSea-nya terhubung
-                      ke wallet Solana
-                    - Eligibility hanya menampilkan hasil scan terakhir
-                      + tombol "Clear results"
+  main     = versi stabil: Stage 1 sampai Stage 5 (sudah digabung),
+             termasuk perbaikan 429, wallet Solana, eligibility
+  stage-6  = versi TERBARU, BELUM digabung ke main. Isinya:
+             - Laporan audit (docs/AUDIT-STAGE6.md)
+             - Mint terjadwal (halaman "Scheduled") dengan 3 mode:
+               Monitor only / Notify & confirm / Automatic mint
+             - Pusat notifikasi (klik lonceng)
+             - Tidak perlu lagi mengetik MINT / SEND: cukup klik
+               tombol lalu konfirmasi
+             - Pemulihan setelah aplikasi/PC mati (tercatat jujur)
 
-Cabang lain (stage-1, stage-2, stage-3, stage-4, ui-neon,
-networks-update, fix-rpc-errors) adalah cabang lama yang sudah
-digabung ke main. Boleh diabaikan.
+Cabang lain (stage-1 ... stage-5-offers, ui-neon, networks-update,
+fix-rpc-errors) adalah cabang lama yang sudah digabung ke main.
+Boleh diabaikan.
 
 PENTING: Data pribadi Anda (wallet, private key terenkripsi, database)
 ada di folder "data" di PC Anda, BUKAN di GitHub. Folder itu sengaja
@@ -50,7 +52,7 @@ BAGIAN 2. CARA MEMPERBARUI APLIKASI DI PC KE VERSI TERBARU
 
      git fetch origin
 
-     git checkout stage-5-offers
+     git checkout stage-6
 
      git pull
 
@@ -76,6 +78,7 @@ BAGIAN 3. CARA MENJALANKAN SEHARI-HARI
      Collections  - tambah koleksi OpenSea (slug / link / kontrak)
      Eligibility  - cek wallet mana yang eligible per fase
      Mint         - preview lalu mint dengan banyak wallet sekaligus
+     Scheduled    - mint terjadwal: atur sekali, bot yang menjalankan
      Transfers    - kirim NFT, sweep dana, distribusi dana
      Contracts    - analisa kontrak + custom mint (bukan drop OpenSea)
      Offers       - Offer Manager / auto-accept offer
@@ -86,6 +89,26 @@ BAGIAN 3. CARA MENJALANKAN SEHARI-HARI
                     auto-lock, backup
 
 Tombol STOP darurat menghentikan semua pengiriman transaksi.
+Lonceng (kanan atas) membuka halaman Notifications.
+
+CARA MEMAKAI MINT TERJADWAL (Stage 6):
+1. Buka "Scheduled" -> "+ Schedule a mint" (atau di halaman Mint:
+   klik Preview lalu "Schedule instead").
+2. Pilih koleksi, fase, wallet (semua / grup / yang dipilih),
+   jumlah per wallet, dan BATAS TOTAL BIAYA (wajib untuk mode
+   Notify & confirm dan Automatic).
+3. Pilih mode:
+     Monitor only     = hanya cek & lapor, tidak pernah mengirim
+     Notify & confirm = bot siapkan, Anda klik "Mint now"
+     Automatic mint   = bot mint sendiri saat fase dibuka
+4. Simpan. Sekitar 30 menit sebelum mulai, bot cek eligibility dan
+   kesiapan tiap wallet (saldo, gas, alokasi). Tombol "Wallets"
+   menunjukkan alasan tiap wallet.
+5. BIARKAN aplikasi menyala dan terbuka kuncinya (unlocked) sampai
+   tugas otomatis selesai. Kalau PC mati saat jadwal, tugas ditandai
+   "Missed" (tidak dikirim terlambat tanpa izin Anda).
+6. Setelah selesai, klik "Report" untuk melihat hasil tiap wallet
+   dan alasannya.
 
 ---------------------------------------------------------------------
 BAGIAN 4. BACKUP DATA PRIBADI (WAJIB SEBELUM GANTI PC / UPDATE BESAR)
@@ -137,14 +160,23 @@ BAGIAN 5. MASALAH YANG MASIH TERBUKA (untuk dikerjakan sesi berikut)
       (misal: 1 wallet bersamaan, jeda 2 detik).
    -> Kalau baru saja kena 429, tunggu 10-15 menit sebelum scan lagi.
 
-3. Cabang stage-5-offers BELUM digabung ke main.
-   Kalau semua sudah dicoba dan aman, minta Claude:
-      "merge stage-5-offers ke main"
+3. Cabang stage-6 BELUM digabung ke main.
+   Coba dulu fitur Scheduled dengan mode "Monitor only" atau
+   "Notify & confirm" pada mint sungguhan. Kalau aman, minta Claude:
+      "merge stage-6 ke main"
 
-4. Ide berikutnya yang pernah dibahas (belum dikerjakan):
-   - pengujian Offer Manager dengan offer sungguhan dalam mode
-     "manual/approve" dulu sebelum mode FULL AUTO
-   - perbaikan lain sesuai temuan Anda saat memakai
+4. Sisa dari spesifikasi besar Anda (DEEP UPGRADE AUDIT +
+   ADDITIONAL CORE FEATURES) yang BELUM dikerjakan, sesuai rencana
+   yang Anda setujui (dikerjakan setelah kuota mingguan reset):
+   - Desain ulang UI: sidebar berkelompok, tampilan lebih bersih,
+     sembunyikan detail teknis ke tampilan "Advanced"
+   - Mint Calendar (tampilan bulan / minggu / agenda)
+   - Skor kesiapan wallet 0-100 (sekarang: Ready / alasan per wallet)
+   - Notifikasi Telegram / Discord (opsional)
+   - Laporan audit Medium & Low lengkap (lihat docs/AUDIT-STAGE6.md)
+   - Tombol "Retry failed wallets" dan aksi massal untuk offer
+   - Pengujian Offer Manager dengan offer sungguhan dalam mode
+     manual sebelum FULL AUTO
 
 ---------------------------------------------------------------------
 BAGIAN 6. CARA MELANJUTKAN DI SESI CLAUDE BERIKUTNYA
@@ -164,8 +196,8 @@ pernah tempel API key atau private key langsung di chat.
 ===MULAI=== (salin dari baris ini)
 
 Halo Claude. Saya melanjutkan proyek NFT Ops dari sesi sebelumnya.
-Repo: judith-grimes/nft-ops-bot. Kerjakan di cabang stage-5-offers
-(belum di-merge ke main). Tolong baca file PANDUAN-LANJUTAN.txt,
+Repo: judith-grimes/nft-ops-bot. Kerjakan di cabang stage-6
+(belum di-merge ke main; main = Stage 1-5). Tolong baca file PANDUAN-LANJUTAN.txt,
 README.md dan VENDORED.md di repo dulu sebelum mengubah apa pun.
 Jawab saya dalam bahasa yang sederhana, langkah Windows ditulis
 satu perintah per blok.
@@ -202,6 +234,18 @@ Ringkasan teknis:
   4) Scan eligibility baru menghapus hasil lama koleksi itu;
      ada tombol "Clear results" dan info "last scan".
   Semua test lulus (79): uv run pytest -q
+- Stage 6 (cabang stage-6): docs/AUDIT-STAGE6.md (audit Critical/
+  High), recovery.py (pemulihan setelah restart + rekonsiliasi
+  receipt), scheduler.py (tabel scheduled_mints, mode monitor/
+  confirm/auto, klaim atomik agar tidak jalan 2x, missed window,
+  jeda bila jadwal fase berubah, laporan per wallet), notify.py
+  (notifikasi di tabel alerts: category/title/link),
+  static/stage6.js (halaman Scheduled + Notifications, dialog
+  konfirmasi menggantikan ketik MINT/SEND). 88 test lulus.
+  Spesifikasi lengkap user: file "NFT OPS BOT - DEEP UPGRADE AUDIT"
+  dan "ADDITIONAL CORE FEATURES" (Notification Center, Wallet
+  Readiness Score, Mint Calendar). Yang belum: lihat PANDUAN
+  bagian 5 nomor 4.
 - Masalah terbuka: wallet 0x7b7db1358895d2C746bbf3E7A416757957B67C7F
   sebelumnya error "OpenSea returned an invalid address, integer, or
   calldata field". Perbaikan di atas belum dipastikan di OpenSea asli.
@@ -254,6 +298,8 @@ Stage 5 : Portfolio (floor price, tracking, P&L) + Offer Manager
           (auto-accept offer dengan aturan dan proteksi)
 Sesudahnya: perbaikan 429 eligibility, wallet terhubung Solana,
           eligibility hanya tampilkan scan terakhir
+Stage 6 : audit, mint terjadwal (3 mode), pusat notifikasi,
+          klik-untuk-konfirmasi, pemulihan setelah restart
 
 ---------------------------------------------------------------------
 BAGIAN 8. ISTILAH SEDERHANA
