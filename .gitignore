@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.tmp
+
+# Personal guide kept outside git
+PANDUAN-LANJUTAN.txt
