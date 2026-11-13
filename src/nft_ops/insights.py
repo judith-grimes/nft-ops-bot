@@ -233,7 +233,8 @@ def health(db: Database, beats: dict[str, float], tasks: dict[str, Any], stopped
         "scheduler": loop("scheduler", 30),
         "monitor": loop("monitor", 900),
         "offers": loop("offers", 3600),
-        "rpc": {"ok": all(n["healthy"] for n in key_nets) if key_nets else True, "networks": nets,
+        # a network never checked yet is "unknown", not a failure
+        "rpc": {"ok": all(n["healthy"] for n in key_nets if n["checked_at"]), "networks": nets,
                 "key_networks": key_nets},
         "notifications": {"ok": True, "unread_failures": failures},
     }

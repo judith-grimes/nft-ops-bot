@@ -197,6 +197,27 @@ transaction. Add a second RPC link for each network you mint on (**Networks → 
   the Contracts page. Fill bundled inputs as a JSON list; `{wallet}`, `{quantity}`, `{proof}`,
   `{price_wei}` and `{native}` placeholders work inside it.
 
+## New layout (Stage 6.5)
+
+- **Sidebar navigation** grouped into Workspace, NFT operations, Wallet management, Market
+  operations, Activity and Configuration. Collapse it with « at the bottom; on a phone it opens
+  from the ☰ button. The status at the bottom of the sidebar shows whether the scheduler and
+  RPCs are healthy.
+- **Overview**: wallets, collections, scheduled tasks, successes and items that need attention,
+  what is coming up next, wallet readiness, balances, system health and recent activity.
+- **Eligibility**: summary cards, scan controls with progress, filters, a sortable table and a
+  wallet panel (click a row) that explains the result and what to do next. Every scan is kept in
+  **Scan history** so you can compare with earlier scans.
+- **Readiness (0–100)**: click **Check readiness** on the Eligibility page. Each wallet is scored
+  from real checks: key, eligibility, phase, allocation, funds for the price, funds for fees,
+  RPC, spending limits and pending transactions. Ready / Almost ready / Not ready / Needs
+  attention, with the reason and fix for every failed check. Mints always re-check; an old score
+  is never trusted.
+- **Mint calendar**: month, week and agenda views of official phases (blue) and the bot's
+  scheduled runs (green), with filters and a timezone switch (Asia/Jakarta by default).
+- **Emergency stop** now explains what it halts before stopping, and says clearly that sent
+  transactions cannot be recalled.
+
 ## Scheduled mints and notifications (Stage 6)
 
 Set a mint up once and let NFT Ops watch it. Open **Scheduled → Schedule a mint** (or, on the

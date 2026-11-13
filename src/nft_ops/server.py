@@ -268,7 +268,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
 
     @app.get("/static/{name}")
     async def static(name: str) -> FileResponse:
-        if name not in {"app.js", "stage6.js", "style.css", "icon.svg"}:
+        if name not in {"app.js", "stage6.js", "ui65.js", "style.css", "icon.svg"}:
             raise KeyError("not found")
         return FileResponse(STATIC / name)
 
@@ -349,9 +349,14 @@ def create_app(state: AppState, port: int) -> FastAPI:
         upcoming.sort(key=lambda s: s["starts_at"])
         eligible = db.one("SELECT COUNT(DISTINCT address) AS n FROM eligibility "
                           "WHERE status = 'ELIGIBLE'")["n"]
+        readiness = {r["status"]: r["n"] for r in db.all(
+            "SELECT status, COUNT(DISTINCT address) AS n FROM wallet_readiness WHERE checked_at >= ? "
+            "GROUP BY status", (time.time() - 86_400,))}
+        n_collections = db.one("SELECT COUNT(*) AS n FROM collections")["n"]
         return {
             "wallets": wallets["n"] or 0, "with_keys": wallets["k"] or 0, "totals": totals,
             "eligible_wallets": eligible, "last24h": counts, "upcoming": upcoming[:10],
+            "readiness_24h": readiness, "collections": n_collections,
             "active_jobs": [j for j in state.mint.list_jobs() if j["status"] == "running"],
             "active_tx_jobs": [j for j in state.tx.list_jobs() if j["status"] == "running"],
             "recent": db.all("SELECT * FROM history ORDER BY id DESC LIMIT 10"),
@@ -528,11 +533,14 @@ def create_app(state: AppState, port: int) -> FastAPI:
             raise ValueError("no wallets in this selection")
         # Each scan replaces the previous results for this collection, so the table shows
         # only the wallets just checked (not everything ever scanned).
-        eligibility.clear(state.db, slug)
-        last = state.db.get_setting("eligibility_last", {}) or {}
-        last[slug] = {"group": str(data.get("group") or "") or "All wallets",
-                      "total": len(addresses), "at": time.time()}
-        state.db.set_setting("eligibility_last", last)
+        replace = bool(data.get("replace", True))   # False = re-check single wallets in place
+        if replace:
+            eligibility.clear(state.db, slug)
+            last = state.db.get_setting("eligibility_last", {}) or {}
+            label = (str(data.get("group") or "") or
+                     (f"{len(addresses)} selected wallets" if data.get("addresses") else "All wallets"))
+            last[slug] = {"group": label, "total": len(addresses), "at": time.time()}
+            state.db.set_setting("eligibility_last", last)
         settings = state.db.get_setting("eligibility", {}) or {}
         state.scan_progress = {"slug": slug, "total": len(addresses), "done": 0, "running": True,
                                "rate_limited": False}
@@ -551,7 +559,9 @@ def create_app(state: AppState, port: int) -> FastAPI:
                     spacing_seconds=float(settings.get("spacing_seconds", 1.0)),
                     on_result=on_result, should_stop=lambda: state.safety.stopped)
                 state.scan_progress["rate_limited"] = bool(counts.pop("rate_limited", False))
-                insights.record_scan(state.db, slug, str(data.get("group") or "") or "All wallets", counts)
+                if replace:
+                    insights.record_scan(state.db, slug, (state.db.get_setting("eligibility_last", {})
+                                                          or {}).get(slug, {}).get("group", "scan"), counts)
                 state.bus.publish("eligibility_done", slug=slug, counts=counts,
                                   rate_limited=state.scan_progress["rate_limited"])
             finally:
