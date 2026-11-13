@@ -94,3 +94,29 @@ def test_security_headers_and_static(client):
     assert r.status_code == 200 and "default-src 'self'" in r.headers["content-security-policy"]
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/static/../server.py").status_code in (400, 404)
+
+
+def test_new_eligibility_scan_replaces_old_results(client):
+    with client:
+        h = login(client)
+        other = "11" * 32
+        client.post("/api/wallets/import-keys", json={"text": f"a1, 0x{KEY}", "group": "a"}, headers=h)
+        client.post("/api/wallets/import-keys", json={"text": f"b1, 0x{other}", "group": "b"}, headers=h)
+        groups = {w["label"]: w["address"] for w in client.get("/api/wallets", headers=h).json()["wallets"]}
+
+        def scan(group: str) -> list[str]:
+            r = client.post("/api/eligibility/scan", json={"slug": "fake-drop", "group": group}, headers=h)
+            assert r.status_code == 200, r.text
+            for _ in range(200):
+                d = client.get("/api/eligibility?slug=fake-drop", headers=h).json()
+                if not d["progress"]["running"]:
+                    break
+                time.sleep(0.05)
+            assert d["last_scan"]["group"] == group and d["last_scan"]["total"] == 1
+            return sorted({r["address"] for r in d["rows"]})
+
+        assert scan("a") == [groups["a1"]]
+        assert scan("b") == [groups["b1"]]            # group a's old results are gone
+        assert client.post("/api/eligibility/clear", json={"slug": "fake-drop"}, headers=h).status_code == 200
+        d = client.get("/api/eligibility?slug=fake-drop", headers=h).json()
+        assert d["rows"] == [] and d["last_scan"] is None

@@ -20,22 +20,34 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import TypeVar
+from urllib.parse import urljoin, urlsplit
 
-from eth_utils.address import is_address
+from eth_utils.address import is_address, is_same_address, to_checksum_address
 
 from osnm_z.config import DEFAULT_OPENSEA_ATTEMPTS, OpenSeaConfig
 from osnm_z.domain import ZERO_ADDRESS
 from osnm_z.hooks import emit
-from osnm_z.opensea import ELIGIBILITY_QUERY, WalletOpenSeaClient
+from osnm_z.opensea import (
+    AUTH_RESPONSE_LIMIT,
+    ELIGIBILITY_QUERY,
+    WalletOpenSeaClient,
+    _BodyReadError,
+    _read_limited_body,
+)
 from osnm_z.opensea_protocol import (
+    SIWE_STATEMENT,
     EligibilitySnapshot,
     ErrorKind,
     ProtocolError,
+    create_siwe_message,
     decode_eligibility,
     is_retryable_request_error,
+    validate_authentication_response,
     validate_slug,
 )
+from osnm_z.signing import WalletSigner, WalletSignerError
 
 T = TypeVar("T")
 
@@ -130,6 +142,21 @@ def drop_non_evm_wallets(data: object) -> object:
     return {**data, "dropBySlug": drop}
 
 
+def check_signin_answer(body: bytes, wallet: str) -> None:
+    """osnm-z's sign-in check, tolerant of accounts whose main address is not EVM.
+
+    OpenSea answers a successful sign-in with the account's user record. When the account's
+    main address is a Solana (non-EVM) wallet, osnm-z cannot read it and rejects the sign-in
+    ("invalid address ..."), even though OpenSea accepted the signature from this wallet.
+    That one case is accepted. A *different EVM* address still fails as a session mismatch.
+    """
+    try:
+        validate_authentication_response(body, wallet)
+    except ProtocolError as error:
+        if error.kind is not ErrorKind.INVALID_PROTOCOL_VALUE:
+            raise
+
+
 class PacedOpenSeaClient(WalletOpenSeaClient):
     def __init__(self, config: OpenSeaConfig, limiter: SignInLimiter) -> None:
         super().__init__(config)
@@ -165,6 +192,50 @@ class PacedOpenSeaClient(WalletOpenSeaClient):
                 self._limiter.succeeded()
             return result
         raise AssertionError("bounded OpenSea retry loop did not return")
+
+    async def _authenticate_once(self, signer: WalletSigner, wallet: str, chain_id: int,
+                                 slug: str) -> None:
+        # Same steps as osnm-z (nonce, SIWE message, signature, verify); only the final
+        # answer check is check_signin_answer instead of the strict upstream one.
+        if chain_id <= 0 or not is_address(wallet):
+            raise ProtocolError(ErrorKind.INVALID_PROTOCOL_VALUE)
+        validate_slug(slug)
+        self._set_connected_account_hint(wallet)
+        collection_url = self._collection_url(slug)
+        nonce = await self._request_nonce(collection_url)
+        issued_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        address = to_checksum_address(wallet)
+        domain = urlsplit(self._site_url).hostname
+        if domain is None:
+            raise ProtocolError(ErrorKind.COMPATIBILITY)
+        message = create_siwe_message(domain, address, collection_url, chain_id, nonce, issued_at)
+        if not is_same_address(signer.identity.address, wallet):
+            raise ProtocolError(ErrorKind.AUTHENTICATION_SESSION_MISMATCH)
+        try:
+            signature = signer.sign_personal_message(message.encode())
+        except WalletSignerError as error:
+            raise ProtocolError(ErrorKind.SIGNING) from error
+        body: dict[str, object] = {
+            "message": {"domain": domain, "address": address, "statement": SIWE_STATEMENT,
+                        "uri": collection_url, "version": "1", "chainId": str(chain_id),
+                        "nonce": nonce, "issuedAt": issued_at, "accountType": "Ethereum"},
+            "signature": signature,
+            "chainArch": "EVM",
+        }
+        response = await self._send(urljoin(self._site_url, "/__api/auth/siwe/verify"),
+                                    headers={"origin": self._origin(), "referer": collection_url},
+                                    body=body)
+        try:
+            if not response.is_success:
+                raise ProtocolError(ErrorKind.AUTHENTICATION, response.status_code)
+            try:
+                response_body = await _read_limited_body(response, AUTH_RESPONSE_LIMIT)
+            except _BodyReadError as error:
+                raise ProtocolError(ErrorKind.TRANSPORT) from error
+        finally:
+            await response.aclose()
+        check_signin_answer(response_body, wallet)
+        self._authenticated_wallet = to_checksum_address(wallet)
 
     async def _eligibility_once(self, slug: str, wallet: str) -> EligibilitySnapshot:
         # Same request as osnm-z; only the answer is cleaned of non-EVM linked wallets first.

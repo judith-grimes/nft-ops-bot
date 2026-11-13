@@ -472,6 +472,15 @@ def create_app(state: AppState, port: int) -> FastAPI:
         slug = str(data["slug"])
         meta = await collections.load(state.db, state.opensea_factory, slug, None)
         addresses = selection(data)
+        if not addresses:
+            raise ValueError("no wallets in this selection")
+        # Each scan replaces the previous results for this collection, so the table shows
+        # only the wallets just checked (not everything ever scanned).
+        eligibility.clear(state.db, slug)
+        last = state.db.get_setting("eligibility_last", {}) or {}
+        last[slug] = {"group": str(data.get("group") or "") or "All wallets",
+                      "total": len(addresses), "at": time.time()}
+        state.db.set_setting("eligibility_last", last)
         settings = state.db.get_setting("eligibility", {}) or {}
         state.scan_progress = {"slug": slug, "total": len(addresses), "done": 0, "running": True,
                                "rate_limited": False}
@@ -502,7 +511,20 @@ def create_app(state: AppState, port: int) -> FastAPI:
         meta = collections.get(state.db, slug)
         return {"rows": eligibility.table(state.db, slug, meta),
                 "collection": collections.describe(meta), "progress": state.scan_progress,
-                "signin": SHARED_LIMITER.status()}
+                "signin": SHARED_LIMITER.status(),
+                "last_scan": (state.db.get_setting("eligibility_last", {}) or {}).get(slug)}
+
+    @app.post("/api/eligibility/clear")
+    async def eligibility_clear(request: Request) -> dict:
+        data = await body(request)
+        if state.scan_task and not state.scan_task.done():
+            raise ValueError("wait for the running scan to finish")
+        slug = str(data["slug"])
+        eligibility.clear(state.db, slug)
+        last = state.db.get_setting("eligibility_last", {}) or {}
+        last.pop(slug, None)
+        state.db.set_setting("eligibility_last", last)
+        return ok()
 
     @app.get("/api/eligibility.csv")
     async def eligibility_csv(slug: str) -> PlainTextResponse:

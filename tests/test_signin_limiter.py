@@ -143,3 +143,55 @@ def test_linked_solana_wallet_no_longer_breaks_eligibility():
     snap = decode_eligibility(drop_non_evm_wallets(raw), wallet)
     assert snap.stages[0].is_eligible is True and snap.stages[0].eligible_max_total_mintable_by_wallet == 2
     assert raw["dropBySlug"]["accountStageEligibility"]["wallets"][1]["address"] == solana  # input untouched
+
+
+def test_signin_accepted_when_account_main_address_is_solana():
+    import orjson
+
+    from nft_ops.os_signin import check_signin_answer
+    wallet = "0x7b7db1358895d2C746bbf3E7A416757957B67C7F"
+    check_signin_answer(orjson.dumps({"user": {"address": "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV"}}), wallet)
+    check_signin_answer(orjson.dumps({"user": {"address": wallet.lower()}}), wallet)
+    try:   # a different EVM wallet is still refused
+        check_signin_answer(orjson.dumps({"user": {"address": "0x" + "ab" * 20}}), wallet)
+        raise AssertionError("expected a session mismatch")
+    except ProtocolError as error:
+        assert error.kind is ErrorKind.AUTHENTICATION_SESSION_MISMATCH
+
+
+def test_full_signin_and_eligibility_with_solana_main_account():
+    import json
+
+    import httpx
+
+    from osnm_z.signing import WalletSigner
+
+    key = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+    signer = WalletSigner.from_private_key(key)
+    wallet = signer.identity.address
+    solana = "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV"
+    seen = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/siwe/nonce"):
+            return httpx.Response(200, json={"nonce": "abcdef1234567890"})
+        if request.url.path.endswith("/siwe/verify"):
+            sent = json.loads(request.content)
+            assert sent["message"]["address"] == wallet and sent["signature"]
+            return httpx.Response(200, json={"user": {"address": solana}})
+        return httpx.Response(200, json={"data": _answer(wallet, solana)})
+
+    async def run():
+        clock = Clock()
+        client = PacedOpenSeaClient(OpenSeaConfig(), SignInLimiter(spacing=0, clock=clock, sleep=clock.sleep))
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+        try:
+            await client.authenticate(signer, wallet, 4663, "fake-drop")
+            snap = await client.eligibility("fake-drop", wallet)
+        finally:
+            await client.aclose()
+        assert snap.stages[0].is_eligible is True
+    asyncio.run(run())
+    assert any(p.endswith("/siwe/verify") for p in seen)

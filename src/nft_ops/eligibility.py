@@ -138,6 +138,11 @@ async def check_wallet_detail(metadata: CollectionMetadata, factory: OpenSeaFact
     return classify(metadata, snapshot, error, has_key), limited
 
 
+def clear(db: Database, slug: str) -> None:
+    """Forget earlier results for this collection (a new scan replaces them)."""
+    db.execute("DELETE FROM eligibility WHERE slug = ?", (slug,))
+
+
 def save(db: Database, slug: str, address: str, results: list[StageResult]) -> None:
     now = time.time()
     db.executemany(

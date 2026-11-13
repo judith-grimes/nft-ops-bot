@@ -398,7 +398,7 @@ async function renderEligibility() {
   const p = d.progress || {};
   const scanning = p.running && p.slug === S.elig.slug;
   $("#main").innerHTML = `
-    <div class="page-head"><h1>Eligibility</h1><button data-action="export-elig">Export CSV</button></div>
+    <div class="page-head"><h1>Eligibility</h1><div class="row"><button data-action="clear-elig" ${scanning ? "disabled" : ""}>Clear results</button><button data-action="export-elig">Export CSV</button></div></div>
     <div class="panel">
       <div class="row">
         <label>Collection <select id="e-slug">${options(cols, S.elig.slug, (c) => `${c.slug} (${c.chain_name})`, (c) => c.slug)}</select></label>
@@ -408,6 +408,7 @@ async function renderEligibility() {
       <div style="margin-top:10px;${scanning ? "" : "display:none"}"><div class="progress"><div id="scan-bar" style="width:${p.total ? (100 * p.done) / p.total : 0}%"></div></div>
         <div class="tiny muted" id="scan-text">${p.done || 0} / ${p.total || 0} wallets checked${d.signin && d.signin.cooling_down_seconds ? ` — OpenSea asked us to slow down, waiting ${d.signin.cooling_down_seconds}s` : ""}</div></div>
       ${!scanning && p.rate_limited && p.slug === S.elig.slug ? `<p class="tiny" style="color:var(--warn)">The last scan stopped early because OpenSea was rate limiting sign-ins. Wallets it did not reach show UNKNOWN — wait a few minutes, then scan again (or scan a smaller group).</p>` : ""}
+      ${d.last_scan ? `<p class="tiny">Showing the last scan only: <b>${esc(d.last_scan.group)}</b> · ${esc(d.last_scan.total)} wallets · ${esc(new Date(d.last_scan.at * 1000).toLocaleString())}. A new scan replaces these results.</p>` : ""}
       <p class="tiny muted">Each wallet signs in to OpenSea (a free signature, no transaction) and asks which phases it qualifies for.
         <b>ELIGIBLE</b> = OpenSea confirmed. <b>UNKNOWN</b> = could not get an answer (try again), not “ineligible”. <b>UNVERIFIED</b> = watch-only wallet, could not ask.
         Balances and gas are checked separately in the Mint preview.</p>
@@ -1410,6 +1411,7 @@ const ACTIONS = {
   "csv-go": () => guard(async () => { const r = await api("/api/wallets/csv/import", { text: $("#csv-text").value }); closeModal(); toast(`Imported ${r.imported} rows`); render(); }),
   "export-wallets": () => download("/api/wallets/export.csv", "wallets.csv"),
   "export-history": () => download("/api/history.csv", "history.csv"),
+  "clear-elig": () => guard(async () => { if (!confirm("Clear the eligibility results for this collection?")) return; await api("/api/eligibility/clear", { slug: S.elig.slug }); toast("Results cleared"); render(); }),
   "export-elig": () => download(`/api/eligibility.csv?slug=${encodeURIComponent(S.elig.slug)}`, `eligibility-${S.elig.slug}.csv`),
   "refresh-balances": (el) => guard(async () => {
     el.disabled = true;
