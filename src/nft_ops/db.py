@@ -184,6 +184,25 @@ CREATE TABLE IF NOT EXISTS scheduled_mints (
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS wallet_readiness (
+    slug        TEXT NOT NULL,
+    stage_index INTEGER NOT NULL,
+    address     TEXT NOT NULL,
+    score       INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    checks      TEXT NOT NULL,
+    checked_at  REAL NOT NULL,
+    PRIMARY KEY (slug, stage_index, address)
+);
+CREATE TABLE IF NOT EXISTS eligibility_scans (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug        TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    label       TEXT,
+    total       INTEGER NOT NULL,
+    counts      TEXT NOT NULL,
+    results     TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS os_holdings (
     chain_id    INTEGER NOT NULL,
     address     TEXT NOT NULL,          -- owner wallet

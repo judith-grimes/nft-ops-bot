@@ -39,6 +39,7 @@ from . import (
     contracts,
     custommint,
     eligibility,
+    insights,
     market,
     nfts,
     transfers,
@@ -92,6 +93,8 @@ class AppState:
         self.sessions: set[str] = set()
         self.scan_task: asyncio.Task | None = None
         self.scan_progress: dict[str, Any] = {}
+        self.beats: dict[str, float] = {}          # loop heartbeats (system health)
+        self.loops: dict[str, asyncio.Task] = {}
         self.data_dir = data_dir
         self.last_activity = time.time()
         self.tx = TxEngine(self.db, self.vault, self.pool, self.bus, self.safety)
@@ -177,6 +180,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
                 await asyncio.sleep(60)
         task = asyncio.create_task(health_loop())
         monitor_task = asyncio.create_task(state.monitor.run_forever())
+        state.loops["monitor"] = monitor_task
 
         async def lock_loop() -> None:
             while True:
@@ -187,10 +191,12 @@ def create_app(state: AppState, port: int) -> FastAPI:
                     pass
         lock_task = asyncio.create_task(lock_loop())
         offers_task = asyncio.create_task(state.offers.run_forever())
+        state.loops["offers"] = offers_task
 
         async def schedule_loop() -> None:
             last_reconcile = 0.0
             while True:
+                state.beats["scheduler"] = time.time()
                 try:
                     await state.scheduler.tick()
                     if time.time() - last_reconcile >= 60:
@@ -201,6 +207,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
                     pass
                 await asyncio.sleep(5)
         schedule_task = asyncio.create_task(schedule_loop())
+        state.loops["scheduler"] = schedule_task
         try:
             yield
         finally:
@@ -544,6 +551,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
                     spacing_seconds=float(settings.get("spacing_seconds", 1.0)),
                     on_result=on_result, should_stop=lambda: state.safety.stopped)
                 state.scan_progress["rate_limited"] = bool(counts.pop("rate_limited", False))
+                insights.record_scan(state.db, slug, str(data.get("group") or "") or "All wallets", counts)
                 state.bus.publish("eligibility_done", slug=slug, counts=counts,
                                   rate_limited=state.scan_progress["rate_limited"])
             finally:
@@ -784,6 +792,34 @@ def create_app(state: AppState, port: int) -> FastAPI:
     async def alerts_read() -> dict:
         state.monitor.mark_read()
         return ok()
+
+    # ----- readiness, scan history, calendar, health (Stage 6.5) ------------------------
+    @app.get("/api/readiness")
+    async def readiness_last(slug: str, stage_index: int | None = None) -> dict:
+        return {"wallets": insights.last_readiness(state.db, slug, stage_index)}
+
+    @app.post("/api/readiness")
+    async def readiness_check(request: Request) -> dict:
+        data = await body(request)
+        return await insights.readiness(state.db, state.mint, state.pool, state.safety,
+                                        str(data["slug"]), int(data["stage_index"]), selection(data),
+                                        int(data.get("quantity") or 1))
+
+    @app.get("/api/eligibility/scans")
+    async def eligibility_scans(slug: str) -> dict:
+        return {"scans": insights.scans(state.db, slug)}
+
+    @app.get("/api/eligibility/scans/{scan_id}")
+    async def eligibility_scan_detail(scan_id: int) -> dict:
+        return insights.scan_results(state.db, scan_id)
+
+    @app.get("/api/calendar")
+    async def calendar() -> dict:
+        return {"events": insights.calendar(state.db)}
+
+    @app.get("/api/health")
+    async def health() -> dict:
+        return insights.health(state.db, state.beats, state.loops, state.safety.stopped)
 
     # ----- notifications ---------------------------------------------------------------
     @app.get("/api/notifications")
