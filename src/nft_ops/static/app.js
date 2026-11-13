@@ -106,6 +106,15 @@ const symbol = (chainId) => network(chainId)?.native_symbol || "ETH";
 
 // ---------------------------------------------------------------- modal
 function modal(html) { $("#modal-card").innerHTML = html; $("#modal").classList.remove("hidden"); const f = $("#modal-card input, #modal-card textarea"); if (f) f.focus(); }
+// Click-to-confirm dialog (replaces typing MINT / SEND). Resolves true when confirmed.
+function askConfirm(title, bodyHTML, okLabel = "Confirm") {
+  return new Promise((resolve) => {
+    modal(`<h2>${esc(title)}</h2><div>${bodyHTML}</div>
+      <div class="row" style="margin-top:14px"><span class="spacer"></span><button id="ask-no">Cancel</button><button class="primary" id="ask-yes">${esc(okLabel)}</button></div>`);
+    $("#ask-no").onclick = () => { closeModal(); resolve(false); };
+    $("#ask-yes").onclick = () => { closeModal(); resolve(true); };
+  });
+}
 function closeModal() { $("#modal").classList.add("hidden"); $("#modal-card").innerHTML = ""; }
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
 
@@ -478,7 +487,7 @@ function mintPanelHTML({ w, col, stages, stage }, compact) {
         <button class="primary" data-action="preview" ${stage ? "" : "disabled"}>Preview</button>
       </div>
       ${compact ? `<details><summary class="tiny muted">Gas, fees and limits</summary><div class="row" style="margin-top:8px">${advanced}</div></details>` : ""}
-      <p class="tiny muted">Preview checks every wallet (eligibility, balance, gas, allocation, limits; open public phases are simulated on-chain). Nothing is sent until you type MINT.</p>`;
+      <p class="tiny muted">Preview checks every wallet (eligibility, balance, gas, allocation, limits; open public phases are simulated on-chain). Nothing is sent until you confirm.</p>`;
 }
 function bindMintPanel({ w }) {
   const m = S.mint, f = m.form;
@@ -534,8 +543,8 @@ function previewHTML(p) {
     </table></div>
     ${fundButton(p.rows, p.collection.chain_id, "address") ? `<div class="row" style="margin-top:10px">${fundButton(p.rows, p.collection.chain_id, "address")}<span class="tiny muted">Opens Distribute with each short wallet and the exact amount it is missing (+2%).</span></div>` : ""}
     ${p.token ? `<div class="row" style="margin-top:14px">
-      <label>Type MINT to send ${t.ready} transaction${t.ready === 1 ? "" : "s"}<input id="m-confirm" autocomplete="off" style="width:140px"></label>
-      <button class="primary" data-action="start">Start mint</button>
+      <button class="primary" data-action="start">Mint ${t.ready} wallet${t.ready === 1 ? "" : "s"} now</button>
+      <button data-action="schedule-from-mint">Schedule instead</button>
       <span class="tiny muted">Preview valid for ${countdown(p.created + p.expires_in)}. Only READY wallets are included.</span></div>` : ""}
   </div>`;
 }
@@ -712,7 +721,7 @@ function onAlert(ev) {
   }
   if (S.page === "overview") scheduleRefresh();
 }
-$("#bell").addEventListener("click", () => ACTIONS_EXTRA.alerts());
+$("#bell").addEventListener("click", () => go("notifications"));
 
 // ---------------------------------------------------------------- transfers
 function assetName(asset, chainId) {
@@ -898,7 +907,7 @@ function txPreviewHTML(p) {
     </table></div>
     ${fundButton(p.rows, p.chain_id, "source") ? `<div class="row" style="margin-top:10px">${fundButton(p.rows, p.chain_id, "source")}<span class="tiny muted">Opens Distribute with each short wallet and the exact amount it is missing (+2%).</span></div>` : ""}
     ${p.token ? `<div class="row" style="margin-top:14px">
-      <label>Check every row above, then type ${esc(p.confirm_word)}<input id="tx-confirm" autocomplete="off" style="width:140px"></label>
+      ${p.kind === "approval" ? `<label>This gives a marketplace permission over your NFTs. Type ${esc(p.confirm_word)} to allow it<input id="tx-confirm" autocomplete="off" style="width:140px"></label>` : ""}
       <button class="primary" data-action="tx-start">Send ${t.ready} transaction${t.ready === 1 ? "" : "s"}</button>
       <span class="tiny muted">Preview valid for ${countdown(p.created + p.expires_in)}. Only READY rows are sent, exactly as shown.</span></div>` : ""}
   </div>`;
@@ -987,7 +996,16 @@ Object.assign(ACTIONS_EXTRA, {
   "book-remove": (el) => guard(async () => { if (!confirm("Remove this address from the address book?")) return; await api("/api/addressbook", { action: "remove", address: el.dataset.address }); render(); }),
   "list-delete": (el) => guard(async () => { if (!confirm(`Delete list “${el.dataset.name}”?`)) return; await api("/api/addressbook", { action: "delete_list", name: el.dataset.name }); render(); }),
   "tx-start": (el) => guard(() => withBusy(el, "Sending…", async () => {
-    const r = await api("/api/tx/start", { token: S.tx.preview.token, confirm: $("#tx-confirm").value });
+    const p = S.tx.preview, t = p.totals || {};
+    const word = p.kind === "approval" ? $("#tx-confirm").value : p.confirm_word;
+    if (p.kind !== "approval") {
+      const inModal = !$("#modal").classList.contains("hidden"), keep = inModal ? $("#modal-card").innerHTML : null;
+      const yes = await askConfirm("Send these transactions?", `<p>${t.ready} transaction${t.ready === 1 ? "" : "s"} on ${esc(network(p.chain_id)?.name || "")}.</p>
+        <ul><li>Leaves your wallets: ${esc(t.external_spend ?? "—")}</li><li>Gas at most: ${esc(t.max_gas ?? "—")}</li></ul><p class="tiny muted">Only the READY rows are sent, exactly as previewed.</p>`, "Send");
+      if (keep) modal(keep);
+      if (!yes) return;
+    }
+    const r = await api("/api/tx/start", { token: p.token, confirm: word });
     S.tx.preview = null; ["#tx-preview", "#c-preview"].forEach((id) => { if ($(id)) $(id).innerHTML = ""; });
     if (!$("#modal").classList.contains("hidden")) { closeModal(); if (S.page === "offers") setTimeout(() => render(), 3000); }
     toast(`Operation #${r.job_id} started`); renderTxJobs();
@@ -1463,11 +1481,11 @@ const ACTIONS = {
         <tr><td>Max fee</td><td class="mono">${esc(p.old_max_fee_gwei)} → ${esc(p.new_max_fee_gwei)} gwei</td></tr>
         <tr><td>Max gas cost</td><td class="mono">${esc(p.max_gas_cost)} ${esc(symbol(p.chain_id))}</td></tr></table></div>
       ${p.problems.map((x) => `<div class="notice bad">${esc(x)}</div>`).join("")}
-      ${p.token ? `<label>Type ${esc(p.confirm_word)} to send the replacement<input id="replace-confirm" autocomplete="off"></label>` : ""}
+      ${p.token ? `<p class="tiny muted">Sends one replacement transaction with the same nonce. Only one of the two can be mined.</p>` : ""}
       <div class="row"><span class="spacer"></span><button data-action="close">Close</button>${p.token ? `<button class="primary" data-action="replace-go">Send replacement</button>` : ""}</div>`);
   }),
   "replace-go": (el) => guard(() => withBusy(el, "Sending…", async () => {
-    const r = await api("/api/tx/replace/send", { token: S.replace.token, confirm: $("#replace-confirm").value });
+    const r = await api("/api/tx/replace/send", { token: S.replace.token, confirm: S.replace.confirm_word || "REPLACE" });
     closeModal(); toast(`Replacement sent: ${short(r.tx_hash)}`); render();
   })),
   backup: () => modal(`<h2>Download backup</h2><p class="muted">Your keys stay encrypted inside it. Keep the file private and remember the password.</p>
@@ -1537,7 +1555,11 @@ const ACTIONS = {
   start: (el) => guard(async () => {
     el.disabled = true;
     try {
-      const r = await api("/api/mint/start", { token: S.mint.preview.token, confirm: $("#m-confirm").value });
+      const p = S.mint.preview, t = p.totals, sym = symbol(p.collection.chain_id);
+      if (!await askConfirm("Start this mint?", `<p><b>${esc(p.collection.slug)}</b> · ${esc(p.stage.name)} on ${esc(network(p.collection.chain_id)?.name || "")}</p>
+        <ul><li>${t.ready} wallet${t.ready === 1 ? "" : "s"} × ${esc(S.mint.form.quantity)} NFT</li><li>Mint cost ${esc(t.value)} ${esc(sym)}, gas at most ${esc(t.max_gas)} ${esc(sym)}</li><li>Worst case ${esc(t.worst_case)} ${esc(sym)} (limit ${esc(t.operation_cap)})</li></ul>
+        <p class="tiny muted">Transactions that are already sent cannot be recalled by STOP.</p>`, "Mint now")) return;
+      const r = await api("/api/mint/start", { token: p.token, confirm: "MINT" });
       S.mint.preview = null; $("#preview").innerHTML = ""; toast(`Operation #${r.job_id} started`); renderJobs();
     } finally { el.disabled = false; }
   }),

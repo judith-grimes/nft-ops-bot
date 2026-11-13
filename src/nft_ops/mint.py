@@ -76,6 +76,22 @@ class MintEngineError(Exception):
     pass
 
 
+def params_from(data: dict, addresses: list[str], saved: dict | None = None) -> MintParams:
+    """Build MintParams from a request/task dict, filling gaps from the saved mint settings."""
+    d = {**DEFAULT_MINT_SETTINGS, **(saved or {})}
+    return MintParams(
+        slug=str(data["slug"]), stage_index=int(data["stage_index"]), addresses=addresses,
+        quantity=int(data.get("quantity") or 1),
+        gas_limit=int(data.get("gas_limit") or d["gas_limit"]),
+        fee_mode=str(data.get("fee_mode") or d["fee_mode"]),
+        max_fee_gwei=str(data.get("max_fee_gwei") or d["max_fee_gwei"] or ""),
+        priority_fee_gwei=str(data.get("priority_fee_gwei") or d["priority_fee_gwei"] or ""),
+        public_offset_ms=int(data.get("public_offset_ms") or d["public_offset_ms"]),
+        operation_cap=str(data.get("operation_cap") or ""),
+        pending_timeout_seconds=int(d["pending_timeout_seconds"]),
+    )
+
+
 @dataclass(slots=True)
 class MintParams:
     slug: str
@@ -191,6 +207,7 @@ class MintEngine:
         self.previews: dict[str, Preview] = {}
         self.active_wallets: dict[str, int] = {}
         self.external_busy = lambda address: None   # set by the app: is it in a transfer?
+        self.on_job_done: Callable[[MintJob], None] | None = None   # set by the app
         self._pending_trackers: set[asyncio.Task] = set()
         safety.on_stop(self._cancel_pre_broadcast)
 
@@ -456,6 +473,11 @@ class MintEngine:
                 if self.active_wallets.get(address) == job.id:
                     self.active_wallets.pop(address, None)
             self.bus.publish("job", job=job.summary())
+            if self.on_job_done:
+                try:
+                    self.on_job_done(job)
+                except Exception:  # noqa: BLE001, S110 - a notification must never break a job
+                    pass
 
     async def _run_wallet(self, job: MintJob, run: WalletRun, gateway: Any, chain: Any,
                           public_target: str | None, setup: asyncio.Semaphore) -> None:

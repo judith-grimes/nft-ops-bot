@@ -154,6 +154,36 @@ CREATE TABLE IF NOT EXISTS alerts (
     message     TEXT NOT NULL,
     read        INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS scheduled_mints (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    stage_index     INTEGER NOT NULL,
+    stage_name      TEXT,
+    stage_type      TEXT,
+    chain_id        INTEGER,
+    wallet_source   TEXT NOT NULL,      -- all | group | addresses
+    group_name      TEXT,
+    addresses       TEXT NOT NULL DEFAULT '[]',
+    quantity        INTEGER NOT NULL DEFAULT 1,
+    max_total       TEXT NOT NULL DEFAULT '',
+    mode            TEXT NOT NULL,      -- monitor | confirm | auto
+    phase_starts_at REAL,
+    phase_ends_at   REAL,
+    run_at          REAL NOT NULL,      -- when the bot starts (phase start - lead)
+    lead_seconds    INTEGER NOT NULL DEFAULT 120,
+    timezone        TEXT NOT NULL DEFAULT 'Asia/Jakarta',
+    status          TEXT NOT NULL,
+    status_detail   TEXT,
+    paused_from     TEXT,
+    job_id          INTEGER,
+    readiness       TEXT,
+    checked_at      REAL,
+    eligibility_checked INTEGER NOT NULL DEFAULT 0,
+    report          TEXT,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS os_holdings (
     chain_id    INTEGER NOT NULL,
     address     TEXT NOT NULL,          -- owner wallet
@@ -261,6 +291,10 @@ class Database:
         logcols = {r[1] for r in self._conn.execute("PRAGMA table_info(offer_log)").fetchall()}
         if "chain_id" not in logcols:
             self._conn.execute("ALTER TABLE offer_log ADD COLUMN chain_id INTEGER")
+        acols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
+        for column in ("category TEXT NOT NULL DEFAULT 'collection'", "title TEXT", "link TEXT"):
+            if column.split()[0] not in acols:
+                self._conn.execute(f"ALTER TABLE alerts ADD COLUMN {column}")
         have = {r[1] for r in self._conn.execute("PRAGMA table_info(history)").fetchall()}
         for column in ("asset TEXT", "token_id TEXT", "amount TEXT", "spend_wei TEXT"):
             if column.split()[0] not in have:
