@@ -53,13 +53,14 @@ from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
 from .monitor import Monitor
 from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
 from .nfts import NftError
+from . import aftermint, groups
 from .notify import Notifier
 from .offers import OfferEngine, OfferError
 from .opensea_api import OpenSeaAPI, OpenSeaError
 from .os_signin import SHARED_LIMITER
 from .recovery import reconcile_pending, recover_interrupted
 from .replace import ReplaceError, Replacer
-from .safety import LIMIT_LABELS, Safety, from_wei
+from .safety import LIMIT_LABELS, Safety, from_wei, to_wei
 from .scheduler import ScheduleError, Scheduler
 from .seaport import SeaportError
 from .txengine import TxEngine, TxEngineError
@@ -69,7 +70,7 @@ from .wallets import WalletError, WalletService, checksum, safe_cell
 STATIC = Path(__file__).parent / "static"
 USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
                ContractError, ReplaceError, backup.BackupError, OfferError, OpenSeaError,
-               SeaportError, ScheduleError,
+               SeaportError, ScheduleError, groups.GroupError,
                RpcError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
@@ -109,7 +110,14 @@ class AppState:
         self.notifier = Notifier(self.db, self.bus)
         self.scheduler = Scheduler(self.db, self.mint, self.notifier, self.vault, self.safety,
                                    self._task_wallets, self._task_rescan)
-        self.mint.on_job_done = self.scheduler.job_finished
+        def job_done(job) -> None:
+            self.scheduler.job_finished(job)
+            if any(r.phase == "confirmed" for r in job.runs.values()):
+                task = asyncio.get_event_loop().create_task(aftermint.run(self, job))
+                self._bg.add(task)
+                task.add_done_callback(self._bg.discard)
+        self._bg: set[asyncio.Task] = set()
+        self.mint.on_job_done = job_done
         self.scheduler.recover()
         if self.recovered["jobs"]:
             r = self.recovered
@@ -268,7 +276,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
 
     @app.get("/static/{name}")
     async def static(name: str) -> FileResponse:
-        if name not in {"app.js", "stage6.js", "ui65.js", "ui651.js", "style.css", "icon.svg"}:
+        if name not in {"app.js", "stage6.js", "ui65.js", "ui651.js", "ui652.js", "style.css", "icon.svg"}:
             raise KeyError("not found")
         return FileResponse(STATIC / name)
 
@@ -375,7 +383,9 @@ def create_app(state: AppState, port: int) -> FastAPI:
             w["tokens"] = {t["symbol"]: format_units(b[t["address"]], t["decimals"])
                            for t in tokens if t["address"] in b}
             w["nfts"] = sum(int(v) for k, v in b.items() if k.startswith("nft:"))
-        return {"wallets": rows, "groups": state.wallets.groups(), "tokens": tokens}
+        return {"wallets": rows, "groups": state.wallets.groups() + groups.smart_list(state.db),
+                "tokens": tokens, "roles": {r["name"]: r["role"] for r in state.db.all(
+                    "SELECT name, role FROM groups WHERE role != ''")}}
 
     @app.post("/api/wallets/import-keys")
     async def wallets_import(request: Request) -> dict:
@@ -436,6 +446,16 @@ def create_app(state: AppState, port: int) -> FastAPI:
             state.wallets.delete_group(str(data["name"]))
         elif action == "add":
             state.wallets.add_to_group(list(data["addresses"]), str(data["name"]))
+        elif action == "move":
+            groups.move(state.db, [checksum(a) for a in data["addresses"]], str(data["from"]),
+                        str(data["name"]), state.wallets.add_to_group)
+        elif action == "split":
+            return ok(created=groups.split(state.db, str(data["name"]), int(data["size"]),
+                                           str(data.get("prefix") or ""), state.wallets.add_to_group),
+                      groups=state.wallets.groups())
+        elif action == "options":
+            groups.set_options(state.db, str(data["name"]), data.get("role"), data.get("after_mint"),
+                               checksum(data["vault"]) if data.get("vault") else data.get("vault"))
         elif action == "remove":
             state.wallets.remove_from_group(list(data["addresses"]), str(data["name"]))
         else:
@@ -794,7 +814,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
             if r["chain_id"] and str(r["chain_id"]) not in usd:
                 usd[str(r["chain_id"])] = await market.native_usd(state.db, state.opensea, r["chain_id"])
             price = usd.get(str(r["chain_id"])) if r["chain_id"] else None
-            for k in ("floor", "sales_median", "value", "spent", "received", "pnl"):
+            for k in ("floor", "sales_median", "value", "spent", "spent_mint", "spent_buy", "received", "pnl"):
                 r[f"{k}_usd"] = None if price is None or r[k] is None else r[k] * price
         wallets = state.db.all("SELECT h.address, COALESCE(w.label, '') AS label, COUNT(*) AS nfts "
                                "FROM os_holdings h LEFT JOIN wallets w ON w.address = h.address "
@@ -804,7 +824,11 @@ def create_app(state: AppState, port: int) -> FastAPI:
 
     @app.post("/api/portfolio/refresh")
     async def portfolio_refresh() -> dict:
-        return ok(**await state.offers.scan(sync_holdings=True))
+        result = await state.offers.scan(sync_holdings=True)
+        wallets = [r["address"] for r in state.db.all("SELECT address FROM wallets")]
+        chains = [r["chain_id"] for r in state.db.all("SELECT chain_id FROM networks WHERE enabled = 1")]
+        trades = await market.sync_trades(state.db, state.opensea, wallets, chains)
+        return ok(**result, trades=trades["trades"], trade_errors=trades["errors"])
 
     # ----- monitor & alerts ------------------------------------------------------------
     @app.get("/api/alerts")
@@ -814,6 +838,20 @@ def create_app(state: AppState, port: int) -> FastAPI:
     @app.post("/api/alerts/read")
     async def alerts_read() -> dict:
         state.monitor.mark_read()
+        return ok()
+
+    @app.get("/api/groups/health")
+    async def groups_health(chain_id: int = 4663) -> dict:
+        return {"groups": groups.health(state.db, chain_id), "smart": groups.smart_list(state.db),
+                "roles": groups.ROLES, "after_mint": groups.AFTER_MINT,
+                "smart_settings": groups.smart_settings(state.db)}
+
+    @app.post("/api/groups/smart-settings")
+    async def groups_smart_settings(request: Request) -> dict:
+        data = await body(request)
+        to_wei(str(data.get("low_gas", "0.002")))
+        state.db.set_setting("smart_groups", {"chain_id": int(data.get("chain_id", 4663)),
+                                              "low_gas": str(data.get("low_gas", "0.002"))})
         return ok()
 
     # ----- readiness, scan history, calendar, health (Stage 6.5) ------------------------

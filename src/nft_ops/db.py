@@ -203,6 +203,18 @@ CREATE TABLE IF NOT EXISTS eligibility_scans (
     counts      TEXT NOT NULL,
     results     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS os_trades (
+    chain_id    INTEGER NOT NULL,
+    address     TEXT NOT NULL,
+    tx_hash     TEXT NOT NULL,
+    token_id    TEXT NOT NULL,
+    slug        TEXT,
+    side        TEXT NOT NULL,          -- buy | sell
+    amount      REAL,                   -- price in the chain's native coin (None if unknown)
+    symbol      TEXT,
+    ts          REAL NOT NULL,
+    PRIMARY KEY (tx_hash, token_id, address, side)
+);
 CREATE TABLE IF NOT EXISTS os_holdings (
     chain_id    INTEGER NOT NULL,
     address     TEXT NOT NULL,          -- owner wallet
@@ -310,6 +322,10 @@ class Database:
         logcols = {r[1] for r in self._conn.execute("PRAGMA table_info(offer_log)").fetchall()}
         if "chain_id" not in logcols:
             self._conn.execute("ALTER TABLE offer_log ADD COLUMN chain_id INTEGER")
+        gcols = {r[1] for r in self._conn.execute("PRAGMA table_info(groups)").fetchall()}
+        for column in ("role TEXT NOT NULL DEFAULT ''", "after_mint TEXT NOT NULL DEFAULT 'keep'", "vault TEXT"):
+            if column.split()[0] not in gcols:
+                self._conn.execute(f"ALTER TABLE groups ADD COLUMN {column}")
         acols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
         for column in ("category TEXT NOT NULL DEFAULT 'collection'", "title TEXT", "link TEXT"):
             if column.split()[0] not in acols:

@@ -197,6 +197,24 @@ transaction. Add a second RPC link for each network you mint on (**Networks → 
   the Contracts page. Fill bundled inputs as a JSON list; `{wallet}`, `{quantity}`, `{proof}`,
   `{price_wei}` and `{native}` placeholders work inside it.
 
+## Wallet groups and notifications (Stage 6.5.2)
+
+- **Roles** (Wallets → Groups → Role & rules): *Minting* (the Eligibility page starts with this
+  group), *Funding* (where top-ups are paid from), *Vault* (safe storage).
+- **After a successful mint** a group can **send the minted NFTs to the vault wallet**
+  automatically (OpenSea drops). It is a normal previewed transfer: spending limits, STOP and
+  on-chain ownership checks apply, and the result appears in notifications.
+- **Smart groups** (names start with ★) update themselves: ready to mint, low on gas, holds
+  NFTs, eligible for a collection phase. Use them anywhere you pick a group.
+- **Group cards** show wallets, balance, ready and low-gas counts, with **Top up…** (prepares a
+  Distribute preview for exactly what each wallet is missing).
+- **Split a group** into batches (prefix-1, prefix-2, …) and **move or copy** selected wallets
+  between groups.
+- The bell opens a **notification dropdown** (tabs, mark all read, Open). The full list and
+  pop-up settings are behind the ⚙ icon.
+- **Portfolio**: USD prices now work on every chain OpenSea prices (ETH, Base, HyperEVM, ApeChain,
+  …). **Spent** includes NFTs bought on OpenSea, and **Received** uses your OpenSea sales.
+
 ## New layout (Stage 6.5)
 
 - **Sidebar navigation** grouped into Workspace, NFT operations, Wallet management, Market

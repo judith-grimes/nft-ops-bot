@@ -63,8 +63,12 @@ class WalletService:
     def resolve_selection(self, addresses: list[str] | None = None, group: str | None = None,
                           exclude: list[str] | None = None) -> list[str]:
         """Turn 'these addresses' / 'this group' / 'all' into a checked address list."""
+        from . import groups as smart   # local import: groups -> collections -> ... avoids a cycle
+        members = smart.resolve_smart(self.db, group) if group else None
         if addresses:
             chosen = [checksum(a) for a in addresses]
+        elif members is not None:
+            chosen = members
         elif group:
             chosen = [r["address"] for r in self.db.all(
                 "SELECT wg.address FROM wallet_groups wg JOIN groups g ON g.id = wg.group_id "
@@ -153,6 +157,8 @@ class WalletService:
 
     def create_group(self, name: str) -> None:
         name = " ".join(name.split())
+        if name.startswith("★") or name.startswith("smart:"):
+            raise WalletError("names starting with ★ are reserved for smart groups")
         if not name or len(name) > MAX_GROUP:
             raise WalletError(f"group name must be 1-{MAX_GROUP} characters")
         self.db.execute("INSERT OR IGNORE INTO groups(name) VALUES(?)", (name,))

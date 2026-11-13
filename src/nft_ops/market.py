@@ -150,30 +150,93 @@ USD_TTL = 600
 STABLES = {"USDC", "USDT", "USDG", "DAI", "USDC.E", "PYUSD"}
 
 
+def _price(data: dict, *keys: str) -> float | None:
+    for k in keys:                       # OpenSea answers usdPrice (camelCase); accept both
+        v = data.get(k)
+        if v not in (None, ""):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+    return None
+
+
 async def native_usd(db: Database, api: OpenSeaAPI, chain_id: int) -> float | None:
-    """USD price of one native coin: OpenSea's payment-token price, else a stablecoin rate."""
+    """USD price of one native coin.
+
+    1. OpenSea's payment-token price for the chain's native coin (usdPrice).
+    2. Native coin is ETH: the Ethereum ETH price.
+    3. A pricing currency of a tracked collection on that chain, priced in ETH, times ETH/USD.
+    """
     hit = _USD.get(chain_id)
-    if hit and time.time() - hit[0] < USD_TTL:
+    if hit and time.time() - hit[0] < (USD_TTL if hit[1] else 60):
         return hit[1]
     price = None
     chain = CHAIN_SLUGS.get(chain_id)
+    eth_ratio = None
     if chain and api.configured:
         try:
             data = await api.payment_token(chain, "0x0000000000000000000000000000000000000000")
-            price = float(data.get("usd_price")) if data.get("usd_price") else None
-        except (OpenSeaError, ValueError, TypeError):
+            price = _price(data, "usdPrice", "usd_price")
+            eth_ratio = _price(data, "ethPrice", "eth_price")
+        except OpenSeaError:
             price = None
-    if price is None and native_symbol(db, chain_id).upper() == "ETH":
+    native = native_symbol(db, chain_id).upper()
+    if price is None and chain_id != 1 and (native == "ETH" or eth_ratio):
+        eth = await native_usd(db, api, 1)
+        if eth:
+            price = eth if native == "ETH" else eth * eth_ratio
+    if price is None:
         for row in db.all("SELECT info FROM market_collections WHERE chain_id = ?", (chain_id,)):
             for token in (json.loads(row["info"]).get("pricing_currencies") or {}).values():
-                if (isinstance(token, dict) and (token.get("symbol") or "").upper() in STABLES
-                        and token.get("eth_price") and float(token["eth_price"]) > 0):
+                if not isinstance(token, dict) or not token.get("eth_price"):
+                    continue
+                sym = (token.get("symbol") or "").upper()
+                if sym in STABLES and native == "ETH":
                     price = 1 / float(token["eth_price"])
+                elif sym in (native, "W" + native) and chain_id != 1:
+                    eth = await native_usd(db, api, 1)
+                    price = eth * float(token["eth_price"]) if eth else None
+                if price:
                     break
             if price:
                 break
     _USD[chain_id] = (time.time(), price)
     return price
+
+
+async def sync_trades(db: Database, api: OpenSeaAPI, wallets: list[str], chain_ids: list[int]) -> dict:
+    """Record what each wallet bought and sold on OpenSea (for Spent / Received)."""
+    found, errors = 0, []
+    for chain_id in chain_ids:
+        chain = CHAIN_SLUGS.get(chain_id)
+        if not chain:
+            continue
+        for wallet in wallets:
+            try:
+                events = await api.account_sales(wallet, chain)
+            except OpenSeaError as error:
+                errors.append(f"{chain}: {error}")
+                continue
+            rows = []
+            for e in events:
+                buyer, seller = (e.get("buyer") or "").lower(), (e.get("seller") or "").lower()
+                side = "buy" if buyer == wallet.lower() else "sell" if seller == wallet.lower() else None
+                nft = e.get("nft") or {}
+                if not side or not e.get("transaction"):
+                    continue
+                pay = e.get("payment") or {}
+                qty = int(e.get("quantity") or 1) or 1
+                value, _ = to_native(db, chain_id, pay.get("symbol", ""), int(pay.get("quantity") or 0),
+                                     int(pay.get("decimals") or 18), None)
+                rows.append((chain_id, to_checksum_address(wallet), e["transaction"], str(nft.get("identifier", "")),
+                             nft.get("collection"), side, None if value is None else value / qty * qty,
+                             pay.get("symbol"), float(e.get("event_timestamp") or time.time())))
+            db.executemany("INSERT OR REPLACE INTO os_trades VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            found += len(rows)
+    return {"trades": found, "errors": errors[:5]}
 
 
 def portfolio(db: Database, wallet: str | None = None) -> list[dict]:
@@ -185,7 +248,9 @@ def portfolio(db: Database, wallet: str | None = None) -> list[dict]:
                       f"{hw} GROUP BY slug, chain_id, contract", hargs)
     lw, largs = (" AND wallet = ?", (wallet,)) if wallet else ("", ())
     slugs = {h["slug"] for h in holdings} | {r["slug"] for r in db.all(
-        f"SELECT DISTINCT slug FROM offer_log WHERE status = 'accepted' AND slug IS NOT NULL{lw}", largs)}
+        f"SELECT DISTINCT slug FROM offer_log WHERE status = 'accepted' AND slug IS NOT NULL{lw}", largs)} | {
+        r["slug"] for r in db.all("SELECT DISTINCT slug FROM os_trades WHERE slug IS NOT NULL"
+                                  + (" AND address = ?" if wallet else ""), (wallet,) if wallet else ())}
     for slug in sorted(slugs):
         h = next((x for x in holdings if x["slug"] == slug), None)
         snap = latest(db, slug)
@@ -203,14 +268,25 @@ def portfolio(db: Database, wallet: str | None = None) -> list[dict]:
                 spent += int(r["value_wei"] or 0) / 1e18 + int(r["gas_cost_wei"] or 0) / 1e18
         sold = db.one("SELECT COUNT(*) AS n, COALESCE(SUM(net_native), 0) AS net FROM offer_log "
                       f"WHERE slug = ? AND status = 'accepted'{lw}", (slug, *largs))
+        tw, targs = (" AND address = ?", (wallet,)) if wallet else ("", ())
+        bought = db.one("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS v FROM os_trades "
+                        f"WHERE slug = ? AND side = 'buy'{tw}", (slug, *targs))
+        sales = db.one("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS v FROM os_trades "
+                       f"WHERE slug = ? AND side = 'sell'{tw}", (slug, *targs))
         held = h["n"] if h else 0
         value = floor * held if floor is not None else None
+        spent_mint = spent
+        spent += bought["v"]
+        # OpenSea sale events include sales made through the Offer Manager; use them when present
+        received, sold_n = (sales["v"], sales["n"]) if sales["n"] else (sold["net"], sold["n"])
         out.append({
             "slug": slug, "name": (db.one("SELECT name FROM market_collections WHERE slug = ?", (slug,)) or {}).get("name") or slug,
-            "chain_id": h["chain_id"] if h else None,
+            "chain_id": h["chain_id"] if h else (db.one("SELECT chain_id FROM os_trades WHERE slug = ? LIMIT 1",
+                                                          (slug,)) or {}).get("chain_id"),
             "held": held, "floor": floor, "sales_median": snap["sales_median"] if snap else None,
-            "value": value, "spent": spent, "sold": sold["n"], "received": sold["net"],
-            "pnl": None if value is None else sold["net"] + value - spent,
+            "value": value, "spent": spent, "spent_mint": spent_mint, "spent_buy": bought["v"],
+            "bought": bought["n"], "sold": sold_n, "received": received,
+            "pnl": None if value is None else received + value - spent,
             "change_24h": floor_change(db, slug, 24 * 60),
         })
     return sorted(out, key=lambda r: -(r["value"] or 0))
