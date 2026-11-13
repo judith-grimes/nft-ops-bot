@@ -35,6 +35,7 @@ from . import (
     addressbook,
     backup,
     balances,
+    market,
     collections,
     contracts,
     custommint,
@@ -51,7 +52,10 @@ from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
 from .monitor import Monitor
 from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
 from .nfts import NftError
+from .offers import OfferEngine, OfferError
+from .opensea_api import OpenSeaAPI, OpenSeaError
 from .replace import ReplaceError, Replacer
+from .seaport import SeaportError
 from .safety import LIMIT_LABELS, Safety, from_wei
 from .txengine import TxEngine, TxEngineError
 from .vault import Vault, VaultError
@@ -59,7 +63,8 @@ from .wallets import WalletError, WalletService, checksum, safe_cell
 
 STATIC = Path(__file__).parent / "static"
 USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
-               ContractError, ReplaceError, backup.BackupError,
+               ContractError, ReplaceError, backup.BackupError, OfferError, OpenSeaError,
+               SeaportError,
                RpcError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
@@ -67,7 +72,8 @@ OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
 
 class AppState:
     def __init__(self, data_dir: Path, opensea_factory: OpenSeaFactory | None = None,
-                 pool: RpcPool | None = None, gateway_factory=None) -> None:
+                 pool: RpcPool | None = None, gateway_factory=None,
+                 opensea_api: OpenSeaAPI | None = None) -> None:
         self.db = Database(data_dir / "nft-ops.db")
         seed_networks(self.db)
         self.vault = Vault(data_dir / "vault.json")
@@ -85,6 +91,8 @@ class AppState:
         self.last_activity = time.time()
         self.tx = TxEngine(self.db, self.vault, self.pool, self.bus, self.safety)
         self.replacer = Replacer(self.tx)
+        self.opensea = opensea_api or OpenSeaAPI(lambda: self.vault.get_secret("opensea_api_key"))
+        self.offers = OfferEngine(self.db, self.vault, self.pool, self.bus, self.safety, self.tx, self.opensea)
         # A wallet can be in a mint or a transfer operation, never both (nonce safety).
         self.tx.external_busy = self.mint.active_wallets.get
         self.mint.external_busy = self.tx.busy_sources.get
@@ -92,7 +100,7 @@ class AppState:
 
     def busy(self) -> bool:
         """Anything running that must not be interrupted by an automatic lock."""
-        return bool(self.mint.active_wallets or self.tx.busy_sources
+        return bool(self.mint.active_wallets or self.tx.busy_sources or self.offers.locks
                     or (self.scan_task and not self.scan_task.done()))
 
     def auto_lock_minutes(self) -> int:
@@ -146,12 +154,14 @@ def create_app(state: AppState, port: int) -> FastAPI:
                 except Exception:  # noqa: BLE001 - never let the loop die
                     pass
         lock_task = asyncio.create_task(lock_loop())
+        offers_task = asyncio.create_task(state.offers.run_forever())
         try:
             yield
         finally:
             task.cancel()
             monitor_task.cancel()
             lock_task.cancel()
+            offers_task.cancel()
 
     app = FastAPI(title="nft-ops", docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)
@@ -540,6 +550,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
         return {"limits": state.safety.limits_text(), "limit_labels": LIMIT_LABELS,
                 "monitor": state.monitor.settings(),
                 "security": {"auto_lock_minutes": state.auto_lock_minutes()},
+                "offers": state.offers.settings(), "opensea_key": state.opensea.configured,
                 "network": {"broadcast_all": bool((state.db.get_setting("network", {}) or {})
                                                   .get("broadcast_all", True))},
                 "mint": {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})},
@@ -563,6 +574,13 @@ def create_app(state: AppState, port: int) -> FastAPI:
             if not 1 <= int(mint["setup_concurrency"]) <= 50:
                 raise ValueError("setup concurrency must be 1-50")
             state.db.set_setting("mint", mint)
+        if "offers" in data:
+            o = data["offers"]
+            scan, hold = float(o.get("scan_seconds", 60)), float(o.get("holdings_minutes", 10))
+            if not 15 <= scan <= 3600 or not 1 <= hold <= 1440:
+                raise ValueError("offer scan every 15-3600 s, wallet NFT refresh every 1-1440 min")
+            state.db.set_setting("offers", {"enabled": bool(o.get("enabled", True)), "scan_seconds": scan,
+                                            "holdings_minutes": hold, "floor_seconds": 120})
         if "security" in data:
             minutes = int(data["security"].get("auto_lock_minutes", 30))
             if not 0 <= minutes <= 1440:
@@ -610,6 +628,90 @@ def create_app(state: AppState, port: int) -> FastAPI:
             str(data.get("label", ""))[:30], float(data.get("wait_for_open_minutes") or 0))
         return await state.tx.preview("custom_mint", chain_id, items, "Custom mint",
                                       str(data.get("cap") or ""), notes)
+
+    # ----- OpenSea key, offers, portfolio --------------------------------------------------
+    @app.post("/api/opensea/key")
+    async def opensea_key(request: Request) -> dict:
+        key = str((await body(request)).get("key", "")).strip()
+        if key and not (8 <= len(key) <= 200) or any(c.isspace() for c in key):
+            raise ValueError("that does not look like an OpenSea API key")
+        state.vault.set_secret("opensea_api_key", key)
+        return ok(configured=bool(key))
+
+    @app.get("/api/offers")
+    async def offers_dashboard() -> dict:
+        return state.offers.dashboard()
+
+    @app.post("/api/offers/scan")
+    async def offers_scan(request: Request) -> dict:
+        data = await body(request)
+        return ok(**await state.offers.scan(sync_holdings=bool(data.get("sync", True))))
+
+    @app.post("/api/offers/rules")
+    async def offers_rules(request: Request) -> dict:
+        data = await body(request)
+        return ok(rules=state.offers.save_rules(str(data.get("slug") or "*"), dict(data.get("rules") or {})))
+
+    @app.post("/api/offers/control")
+    async def offers_control(request: Request) -> dict:
+        data = await body(request)
+        slug, action = str(data["slug"]), str(data.get("action"))
+        if action == "arm":
+            state.offers.arm(slug, str(data.get("confirm", "")))
+        elif action == "disarm":
+            state.offers.disarm(slug)
+        elif action == "resume":
+            state.offers.resume(slug)
+        elif action == "pause":
+            state.offers.pause(slug, "paused by you")
+        else:
+            raise ValueError("unknown action")
+        return ok()
+
+    @app.post("/api/offers/accept")
+    async def offers_accept(request: Request) -> dict:
+        data = await body(request)
+        items = data.get("items") or [data]
+        if str(data.get("confirm", "")).strip().upper() != "ACCEPT":
+            raise OfferError("type ACCEPT to accept")
+        if len(items) > 50:
+            raise OfferError("accept at most 50 offers at once")
+        results = await asyncio.gather(*(state.offers.accept(
+            str(i["order_hash"]), str(i["contract"]), str(i["token_id"]), str(i["wallet"]), "manual", "ACCEPT")
+            for i in items), return_exceptions=True)
+        return ok(results=[r if isinstance(r, dict) else {"status": "skipped", "reason": str(r)} for r in results])
+
+    @app.post("/api/offers/approval")
+    async def offers_approval(request: Request) -> dict:
+        data = await body(request)
+        chain_id = int(data["chain_id"])
+        items = state.offers.approval_items(chain_id, checksum(str(data["wallet"])), checksum(str(data["contract"])),
+                                            checksum(str(data["operator"])), bool(data.get("approve", True)))
+        note = ("This lets OpenSea's Seaport transfer contract move NFTs of this one collection from this one "
+                "wallet when you accept an offer. It does not touch other collections or your coins. You can "
+                "revoke it at any time.")
+        return await state.tx.preview("approval", chain_id, items, "Approval", "", [note])
+
+    @app.get("/api/offers/log.csv")
+    async def offers_log_csv() -> PlainTextResponse:
+        rows = state.db.all("SELECT * FROM offer_log ORDER BY id")
+        for r in rows:
+            r["ts"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r["ts"])) + " UTC"
+        cols = ["ts", "slug", "nft_name", "token_id", "contract", "wallet", "offerer", "offer_type", "currency",
+                "gross_native", "market_fee", "creator_fee", "gas_native", "net_native", "floor_native",
+                "tx_hash", "status", "reason", "mode", "order_hash"]
+        return _csv_response(_to_csv(rows, cols), "offers-report.csv")
+
+    @app.get("/api/portfolio")
+    async def portfolio() -> dict:
+        rows = market.portfolio(state.db)
+        for r in rows:
+            r["history"] = market.history(state.db, r["slug"], 7)
+        return {"collections": rows, "api_key": state.opensea.configured}
+
+    @app.post("/api/portfolio/refresh")
+    async def portfolio_refresh() -> dict:
+        return ok(**await state.offers.scan(sync_holdings=True))
 
     # ----- monitor & alerts ------------------------------------------------------------
     @app.get("/api/alerts")

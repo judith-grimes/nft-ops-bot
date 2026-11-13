@@ -35,9 +35,9 @@ GAS_BUFFER = 1.2
 FEE_MULTIPLIER = 1.25          # same headroom osnm-z uses for an immediate send
 RECEIPT_TIMEOUT_SECONDS = 180
 CONFIRM_WORD = "SEND"
-CONFIRM_WORDS = {"custom_mint": "MINT"}
+CONFIRM_WORDS = {"custom_mint": "MINT", "approval": "APPROVE"}
 KIND_LABELS = {"sweep": "Fund sweep", "distribute": "Fund distribution",
-               "nft_transfer": "NFT transfer", "custom_mint": "Custom mint"}
+               "nft_transfer": "NFT transfer", "custom_mint": "Custom mint", "approval": "Approval"}
 PREFETCH_SECONDS = 3.0
 SALE_POLL_SECONDS = 0.25       # how often to look for a new block while waiting for a sale         # scheduled sends refresh nonce and balance this long before launch
 

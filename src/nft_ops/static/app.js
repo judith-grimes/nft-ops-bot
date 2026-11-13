@@ -13,7 +13,7 @@ const S = {
         dist: { asset: "native", mode: "equal_each" } },
   stopped: false,
 };
-const PAGES = ["overview", "wallets", "collections", "eligibility", "mint", "transfers", "contracts", "history", "networks", "settings"];
+const PAGES = ["overview", "wallets", "collections", "eligibility", "mint", "transfers", "contracts", "offers", "portfolio", "history", "networks", "settings"];
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -72,7 +72,7 @@ const BADGE = {
   ELIGIBLE: "good", NOT_ELIGIBLE: "bad", UNKNOWN: "warn", UNVERIFIED: "warn", "NOT SCANNED": "warn",
   READY: "good", confirmed: "good", active: "good", healthy: "good",
   pending: "info", submitted: "info", broadcasting: "info", waiting: "info", preparing: "info", queued: "info", running: "info", upcoming: "info",
-  failed: "bad", blocked: "bad", not_submitted: "bad", ended: "", cancelled: "warn", stopped: "warn", finished: "", replaced: "", not_needed: "",
+  failed: "bad", blocked: "bad", not_submitted: "bad", ended: "", cancelled: "warn", stopped: "warn", finished: "", replaced: "", not_needed: "", accepted: "good", skipped: "warn", rejected: "", awaiting: "info", full: "good", semi: "info", safe: "",
 };
 function badge(status) {
   const cls = BADGE[status] ?? (/^(INSUFFICIENT|NOT_|SOLD|PHASE|SIMULATION|LIMIT|ALLOCATION|NO_KEY|GAS|RPC)/.test(status) ? "bad"
@@ -195,6 +195,7 @@ function onEvent(ev) {
   if (ev.kind === "alert") onAlert(ev);
   if (ev.kind === "locked") { toast(`Vault ${ev.reason}`); showLock(); }
   if (ev.kind === "sale_open") toast("Sale is open — sending now", false);
+  if (["offers", "offer_log", "offers_state"].includes(ev.kind) && S.page === "offers") scheduleRefresh();
   if (["replace", "replace_done"].includes(ev.kind) && S.page === "history") scheduleRefresh();
   if (ev.kind === "failover") toast(`RPC did not answer — switched to a backup link (${ev.operation}).`, true);
   if (["run", "job", "mint_log"].includes(ev.kind) && ["mint", "overview"].includes(S.page)) scheduleRefresh();
@@ -210,7 +211,7 @@ function scheduleRefresh() {
     refreshTimer = null;
     if (S.page === "mint") await renderJobs();
     else if (S.page === "transfers" || S.page === "contracts") await renderTxJobs();
-    else if (S.page === "history") await render();
+    else if (S.page === "history" || S.page === "offers") await render();
     else if (S.page === "overview") { if (S.mint.preview || $("#jobs")?.childElementCount) await renderJobs(); else await render(); }
   }, 600);
 }
@@ -634,6 +635,13 @@ async function renderSettings() {
         <label>Wallets checked at the same time (1-10)<input name="concurrency" type="number" value="${esc(d.eligibility.concurrency)}"></label>
         <label>Pause between sign-ins (seconds)<input name="spacing_seconds" value="${esc(d.eligibility.spacing_seconds)}"></label>
         <div class="row" style="margin-top:10px"><button class="primary" type="submit">Save</button></div></form>
+      <form class="panel" id="offers-form"><h2>OpenSea &amp; offers</h2>
+        <p class="tiny muted">Needed for the Offers and Portfolio pages. Get a key from OpenSea's developer portal. It is stored encrypted in your vault.</p>
+        <div class="row"><label style="flex:1 1 240px">OpenSea API key ${d.opensea_key ? `<span class="badge good">saved</span>` : `<span class="badge warn">not set</span>`}<input id="os-key" type="password" autocomplete="off" placeholder="${d.opensea_key ? "•••••• (type to replace)" : "paste your key"}"></label><button type="button" data-action="os-key">Save key</button></div>
+        <label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input name="enabled" type="checkbox" ${d.offers.enabled ? "checked" : ""} style="width:auto"> Watch offers on all my wallets in the background</label>
+        <label>Check offers every (seconds)<input name="scan_seconds" type="number" min="15" value="${esc(d.offers.scan_seconds)}"></label>
+        <label>Refresh which NFTs my wallets hold every (minutes)<input name="holdings_minutes" type="number" min="1" value="${esc(d.offers.holdings_minutes)}"></label>
+        <div class="row" style="margin-top:10px"><button class="primary" type="submit">Save</button></div></form>
       <form class="panel" id="security-form"><h2>Security &amp; backup</h2>
         <label>Lock automatically after (minutes without activity, 0 = never)<input name="auto_lock_minutes" type="number" min="0" max="1440" value="${esc(d.security.auto_lock_minutes)}"></label>
         <p class="tiny muted">It never locks while a mint, transfer or scan is running.</p>
@@ -651,6 +659,8 @@ async function renderSettings() {
   $("#monitor-form").onsubmit = (e) => { e.preventDefault(); guard(async () => {
     await api("/api/monitor/settings", { interval_seconds: Number(e.target.interval_seconds.value), auto_rescan: e.target.auto_rescan.checked }); toast("Monitor settings saved"); }); };
   $("#elig-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/settings", { eligibility: formData(e.target) }); toast("Saved"); }); };
+  $("#offers-form").onsubmit = (e) => { e.preventDefault(); guard(async () => {
+    await api("/api/settings", { offers: { enabled: e.target.enabled.checked, scan_seconds: Number(e.target.scan_seconds.value), holdings_minutes: Number(e.target.holdings_minutes.value) } }); toast("Saved"); }); };
   $("#security-form").onsubmit = (e) => { e.preventDefault(); guard(async () => {
     await api("/api/settings", { security: { auto_lock_minutes: Number(e.target.auto_lock_minutes.value) }, network: { broadcast_all: e.target.broadcast_all.checked } }); toast("Saved"); }); };
   $("#pw-form").onsubmit = (e) => { e.preventDefault(); guard(async () => { await api("/api/vault/password", formData(e.target)); e.target.reset(); toast("Password changed"); }); };
@@ -970,6 +980,7 @@ Object.assign(ACTIONS_EXTRA, {
   "tx-start": (el) => guard(() => withBusy(el, "Sending…", async () => {
     const r = await api("/api/tx/start", { token: S.tx.preview.token, confirm: $("#tx-confirm").value });
     S.tx.preview = null; ["#tx-preview", "#c-preview"].forEach((id) => { if ($(id)) $(id).innerHTML = ""; });
+    if (!$("#modal").classList.contains("hidden")) { closeModal(); if (S.page === "offers") setTimeout(() => render(), 3000); }
     toast(`Operation #${r.job_id} started`); renderTxJobs();
   })),
 });
@@ -1197,7 +1208,159 @@ Object.assign(ACTIONS_EXTRA, {
   })),
 });
 
-const PAGE_RENDER = { overview: renderOverview, wallets: renderWallets, collections: renderCollections, eligibility: renderEligibility, mint: renderMint, transfers: renderTransfers, contracts: renderContracts, history: renderHistory, networks: renderNetworks, settings: renderSettings };
+// ---------------------------------------------------------------- offers (Offer Manager)
+const RULE_FIELDS = {
+  execution_mode: { label: "Execution mode", type: "select", options: [["safe", "Safe — recommend only"], ["semi", "Semi — I confirm each one"], ["full", "Full — automatic once armed"]] },
+  mode: { label: "Minimum price mode", type: "select", options: [["floor_pct", "% of floor"], ["fixed", "Fixed price"], ["floor_premium", "Floor + premium"]] },
+  fixed_min: { label: "Fixed minimum (native coin)", type: "text" },
+  floor_pct: { label: "Minimum % of floor", type: "number" },
+  premium_pct: { label: "Premium over floor (%)", type: "number" },
+  net_pct_of_min: { label: "What I receive must be at least (% of the minimum)", type: "number" },
+  min_net: { label: "And at least (native coin, optional)", type: "text" },
+  min_profit_pct: { label: "Minimum profit vs mint cost (%, optional)", type: "text" },
+  max_fee_pct: { label: "Maximum fees (% of offer)", type: "number" },
+  pause_drop_pct: { label: "Pause if the floor drops more than (%)", type: "number" },
+  drop_window_minutes: { label: "…within (minutes)", type: "number" },
+  max_floor_vs_sales_pct: { label: "Pause if floor is this far from recent sales (%)", type: "number" },
+  max_per_day: { label: "Max sales per 24 h", type: "number" },
+  max_value_per_day: { label: "Max sale value per 24 h (native coin)", type: "text" },
+  max_concurrent: { label: "Max sales at the same time", type: "number" },
+  max_gas: { label: "Max gas per sale (native coin)", type: "text" },
+  allow_stablecoins: { label: "Accept stablecoin offers (converted at OpenSea's rate)", type: "bool" },
+  stable_haircut_pct: { label: "Value stablecoin offers this % lower (safety margin)", type: "number" },
+};
+const OPTIONAL_CHECKS = { fee_pct: "Maximum fees", min_net_abs: "Absolute minimum net", profit: "Minimum profit", floor_sane: "Floor vs recent sales" };
+function openRules(slug) {
+  const d = S.offers, r = slug === "*" ? d.defaults : d.collections.find((c) => c.slug === slug).rules;
+  modal(`<h2>${slug === "*" ? "Default rules (every collection)" : `Rules — ${esc(slug)}`}</h2>
+    <form id="rules-form" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(230px,1fr))">
+      ${Object.entries(RULE_FIELDS).map(([k, f]) => f.type === "bool"
+        ? `<label style="display:flex;gap:8px;align-items:center"><input name="${k}" type="checkbox" ${r[k] ? "checked" : ""} style="width:auto">${esc(f.label)}</label>`
+        : f.type === "select" ? `<label>${esc(f.label)}<select name="${k}">${options(f.options, r[k], (o) => o[1], (o) => o[0])}</select></label>`
+        : `<label>${esc(f.label)}<input name="${k}" value="${esc(r[k])}"></label>`).join("")}
+      <div style="grid-column:1/-1"><div class="tiny muted">Checks that may fail without blocking (all others must pass; ownership, price, net proceeds, gas, floor stability and approval can never be skipped):</div>
+        <div class="chips">${Object.entries(OPTIONAL_CHECKS).map(([k, l]) => `<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-optional="${k}" ${(r.optional || []).includes(k) ? "checked" : ""} style="width:auto">${esc(l)}</label>`).join("")}</div></div>
+      <label style="grid-column:1/-1">Custom rules (advanced, JSON) — e.g. <span class="mono">[{"match": {"token_id": "12"}, "set": {"mode": "fixed", "fixed_min": "0.5"}}]</span>. Match by token_id, trait ("Type:Value"), wallet, offer_type (item/collection/trait) or currency.
+        <textarea name="overrides" rows="3" spellcheck="false">${esc(JSON.stringify(r.overrides || []))}</textarea></label>
+    </form>
+    <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="primary" data-action="of-rules-save" data-slug="${esc(slug)}">Save rules</button></div>`);
+}
+function openAccept() {
+  const rows = (S.offers.offers || []).filter((o) => S.ofSelected.has(ofKey(o)));
+  const net = rows.reduce((a, o) => a + (o.net || 0), 0);
+  modal(`<h2>Accept ${rows.length} offer${rows.length === 1 ? "" : "s"}</h2>
+    <div class="table-wrap"><table><tr><th>NFT</th><th>Wallet</th><th class="num">Offer</th><th class="num">You receive</th></tr>
+      ${rows.map((o) => `<tr><td>${esc(o.nft_name || `#${o.token_id}`)}</td><td class="mono">${esc(short(o.wallet))}</td><td class="num">${fmtN(o.gross_native)}</td><td class="num">${fmtN(o.net)}</td></tr>`).join("")}</table></div>
+    <p class="muted">Every offer is re-checked with fresh data right before sending (still active, still yours, floor, fees, your rules, OpenSea's transaction, and a simulation). Any that fail are skipped with the reason. Estimated total you receive: <b>${fmtN(net)}</b>.</p>
+    <label>Type ACCEPT to sell<input id="accept-text" autocomplete="off"></label>
+    <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="primary" data-action="of-accept-go">Accept</button></div>`);
+}
+const ofKey = (o) => `${o.order_hash}|${o.contract}|${o.token_id}|${o.wallet}`;
+const fmtN = (v) => (v === null || v === undefined ? "—" : Number(v).toFixed(Math.abs(v) < 1 ? 5 : 3).replace(/0+$/, "").replace(/\.$/, ""));
+async function renderOffers() {
+  const d = await api("/api/offers"); S.offers = d;
+  S.ofFilter = S.ofFilter || { slug: "", wallet: "", status: "all", type: "", minNet: "" };
+  S.ofSelected = S.ofSelected || new Set();
+  const f = S.ofFilter, sm = d.summary;
+  const best = new Set(d.best);
+  const rows = d.offers.filter((o) => (!f.slug || o.slug === f.slug) && (!f.wallet || o.wallet === f.wallet) && (!f.type || o.type === f.type)
+    && (f.status === "all" || (f.status === "ok" ? o.qualifies : !o.qualifies)) && (!f.minNet || (o.net || 0) >= Number(f.minNet)));
+  const wallets = [...new Set(d.offers.map((o) => o.wallet))];
+  $("#main").innerHTML = `
+    <div class="page-head"><h1>Offer Manager</h1><span class="tiny muted">${d.last_scan.at ? `last check ${esc(fmtTime(d.last_scan.at))}` : "not checked yet"}</span>
+      <button data-action="of-export">Export CSV</button><button class="primary" data-action="of-scan">Check offers now</button></div>
+    ${d.api_key ? "" : `<div class="notice warn">Add your OpenSea API key in Settings → OpenSea &amp; offers to start watching offers.</div>`}
+    <div class="stat-strip">
+      <div class="stat"><div class="k">Active offers</div><div class="v">${sm.active}</div></div>
+      <div class="stat hot"><div class="k">Qualifying</div><div class="v">${sm.qualifying}</div></div>
+      <div class="stat"><div class="k">Below my rules</div><div class="v">${sm.below}</div></div>
+      <div class="stat"><div class="k">Qualifying gross</div><div class="v">${fmtN(sm.gross)}</div></div>
+      <div class="stat hot"><div class="k">Qualifying net</div><div class="v">${fmtN(sm.net)}</div></div>
+      <div class="stat"><div class="k">Awaiting</div><div class="v">${sm.awaiting}</div></div>
+      <div class="stat"><div class="k">Accepted</div><div class="v">${sm.accepted}</div></div>
+      <div class="stat"><div class="k">Failed</div><div class="v">${sm.failed}</div></div>
+      <div class="stat"><div class="k">Auto-accept on</div><div class="v">${sm.auto_collections}</div></div>
+    </div>
+    <div class="panel"><div class="row"><h2 style="margin:0">Collections</h2><span class="spacer"></span><button class="small" data-action="of-rules" data-slug="*">Default rules</button></div>
+      ${d.collections.length ? `<div class="table-wrap" style="margin-top:10px"><table>
+        <tr><th>Collection</th><th class="num">Held</th><th class="num">Floor</th><th class="num">Recent sales</th><th>Rule</th><th>Mode</th><th>Auto-accept</th><th class="num">Today</th><th></th></tr>
+        ${d.collections.map((c) => `<tr><td>${esc(c.slug)}</td><td class="num">${c.held}</td><td class="num">${fmtN(c.floor)}</td><td class="num">${fmtN(c.sales_median)}</td>
+          <td class="tiny">${c.rules.mode === "fixed" ? `fixed ${esc(c.rules.fixed_min || "—")}` : c.rules.mode === "floor_pct" ? `${c.rules.floor_pct}% of floor` : `floor +${c.rules.premium_pct}%`} · net ≥ ${c.rules.net_pct_of_min}%</td>
+          <td>${badge(c.rules.execution_mode)}</td>
+          <td>${c.paused ? `<span class="badge bad" title="${esc(c.paused)}">paused</span> <button class="small" data-action="of-ctl" data-ctl="resume" data-slug="${esc(c.slug)}">Resume</button>`
+            : c.armed ? `<span class="badge good">armed</span> <button class="small" data-action="of-ctl" data-ctl="disarm" data-slug="${esc(c.slug)}">Switch off</button>`
+            : c.rules.execution_mode === "full" ? `<button class="small primary" data-action="of-arm" data-slug="${esc(c.slug)}">Arm…</button>` : `<span class="muted tiny">—</span>`}</td>
+          <td class="num">${c.today_count} · ${fmtN(c.today_value)}</td>
+          <td><button class="small" data-action="of-rules" data-slug="${esc(c.slug)}">Rules</button></td></tr>
+          ${c.paused ? `<tr><td colspan="9" class="tiny" style="color:var(--bad)">Paused: ${esc(c.paused)}</td></tr>` : ""}`).join("")}</table></div>`
+        : `<div class="empty">No NFTs found in your wallets yet. Click “Check offers now”.</div>`}
+    </div>
+    <div class="row" style="margin-bottom:8px">
+      <label>Collection <select id="of-slug"><option value="">All</option>${options(d.collections, f.slug, (c) => c.slug, (c) => c.slug)}</select></label>
+      <label>Wallet <select id="of-wallet"><option value="">All</option>${options(wallets, f.wallet, short, (x) => x)}</select></label>
+      <label>Show <select id="of-status">${options([["all", "All offers"], ["ok", "Qualifying"], ["no", "Below my rules"]], f.status, (o) => o[1], (o) => o[0])}</select></label>
+      <label>Type <select id="of-type"><option value="">Any</option>${options(["item", "collection", "trait"], f.type)}</select></label>
+      <label>Min net<input id="of-minnet" value="${esc(f.minNet)}" style="width:90px"></label>
+      <span class="spacer"></span><button class="primary" data-action="of-accept-many">Accept selected (${S.ofSelected.size})</button>
+    </div>
+    ${rows.length ? `<div class="table-wrap"><table>
+      <tr><th></th><th>NFT</th><th>Wallet</th><th>Type</th><th class="num">Offer</th><th class="num">Fees</th><th class="num">Gas</th><th class="num">You receive</th><th class="num">vs floor</th><th>Expires</th><th>Verdict</th><th></th></tr>
+      ${rows.map((o) => { const k = ofKey(o); const needsApproval = o.checks.some((c) => c.name === "approved" && !c.ok);
+        return `<tr>
+        <td>${o.qualifies && o.has_key ? `<input type="checkbox" data-ofsel="${esc(k)}" ${S.ofSelected.has(k) ? "checked" : ""}>` : ""}</td>
+        <td>${esc(o.nft_name || o.slug)} <span class="mono tiny">#${esc(o.token_id)}</span>${best.has(o.order_hash + ":" + o.token_id) ? ` <span class="badge info">best</span>` : ""}</td>
+        <td class="mono">${esc(short(o.wallet))}</td><td>${esc(o.type)}</td>
+        <td class="num">${fmtN(o.gross_native)}<div class="tiny muted">${esc(o.currency)}</div></td>
+        <td class="num">${fmtN((o.market_fee || 0) + (o.creator_fee || 0))}</td><td class="num">${fmtN(o.gas_native)}</td>
+        <td class="num"><b>${fmtN(o.net)}</b></td>
+        <td class="num">${o.floor && o.gross_native ? `${Math.round((o.gross_native / o.floor) * 100)}%` : "—"}</td>
+        <td>${countdown(o.expires)}</td>
+        <td class="wrap">${o.qualifies ? badge("READY") : `<span class="tiny">${esc(o.reason)}</span>`}
+          <details><summary class="tiny muted">checks</summary>${o.checks.map((c) => `<div class="tiny">${c.ok ? "✓" : c.optional ? "○" : "✗"} ${esc(c.name)} — ${esc(c.detail)}</div>`).join("")}</details></td>
+        <td>${needsApproval && o.has_key ? `<button class="small" data-action="of-approve" data-chain="${o.chain_id}" data-wallet="${esc(o.wallet)}" data-contract="${esc(o.contract)}" data-operator="${esc(o.operator)}">Approve</button>` : ""}
+          ${o.qualifies && o.has_key ? `<button class="small primary" data-action="of-accept" data-key="${esc(k)}">Accept</button>` : ""}</td></tr>`; }).join("")}
+    </table></div>` : `<div class="panel empty">No offers match.</div>`}
+    <div class="panel" style="margin-top:14px"><h2>Activity</h2>${d.log.length ? `<div class="table-wrap"><table>
+      <tr><th>Time</th><th>NFT</th><th>Status</th><th class="num">Offer</th><th class="num">Fees</th><th class="num">Gas</th><th class="num">Net</th><th class="num">Floor</th><th>Tx</th><th>Reason</th></tr>
+      ${d.log.slice(0, 60).map((l) => `<tr><td class="tiny">${esc(fmtTime(l.ts))}</td><td>${esc(l.slug || "")} #${esc(l.token_id || "")}<div class="tiny muted">${esc(l.mode || "")}</div></td><td>${badge(l.status)}</td>
+        <td class="num">${fmtN(l.gross_native)}</td><td class="num">${fmtN((l.market_fee || 0) + (l.creator_fee || 0))}</td><td class="num">${fmtN(l.gas_native)}</td><td class="num">${fmtN(l.net_native)}</td><td class="num">${fmtN(l.floor_native)}</td>
+        <td>${l.tx_hash ? txLink(l.chain_id || 4663, l.tx_hash) : "—"}</td><td class="wrap tiny">${esc(l.reason || "")}</td></tr>`).join("")}</table></div>` : `<div class="empty">Nothing yet.</div>`}</div>`;
+  const bind = (id, key) => { $(id).onchange = (e) => { f[key] = e.target.value; render(); }; };
+  bind("#of-slug", "slug"); bind("#of-wallet", "wallet"); bind("#of-status", "status"); bind("#of-type", "type"); bind("#of-minnet", "minNet");
+  $$("[data-ofsel]").forEach((cb) => (cb.onchange = (e) => { e.target.checked ? S.ofSelected.add(cb.dataset.ofsel) : S.ofSelected.delete(cb.dataset.ofsel); $("[data-action=of-accept-many]").textContent = `Accept selected (${S.ofSelected.size})`; }));
+}
+
+// ---------------------------------------------------------------- portfolio
+function spark(points) {
+  const v = points.map((p) => p.floor_native).filter((x) => x !== null && x !== undefined);
+  if (v.length < 2) return `<span class="muted tiny">—</span>`;
+  const min = Math.min(...v), max = Math.max(...v), w = 120, h = 30;
+  const pts = v.map((x, i) => `${(i / (v.length - 1)) * w},${max === min ? h / 2 : h - ((x - min) / (max - min)) * h}`).join(" ");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="floor price trend"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2"/></svg>`;
+}
+async function renderPortfolio() {
+  const d = await api("/api/portfolio");
+  const t = d.collections.reduce((a, c) => ({ value: a.value + (c.value || 0), spent: a.spent + c.spent, received: a.received + c.received }), { value: 0, spent: 0, received: 0 });
+  $("#main").innerHTML = `
+    <div class="page-head"><h1>Portfolio</h1><button class="primary" data-action="pf-refresh">Update from OpenSea</button></div>
+    ${d.api_key ? "" : `<div class="notice warn">Add your OpenSea API key in Settings to see holdings and floor prices.</div>`}
+    <div class="stat-strip">
+      <div class="stat hot"><div class="k">Value at floor</div><div class="v">${fmtN(t.value)}</div></div>
+      <div class="stat"><div class="k">Spent minting</div><div class="v">${fmtN(t.spent)}</div></div>
+      <div class="stat"><div class="k">Received from sales</div><div class="v">${fmtN(t.received)}</div></div>
+      <div class="stat hot"><div class="k">Profit / loss</div><div class="v">${fmtN(t.received + t.value - t.spent)}</div></div>
+    </div>
+    <p class="tiny muted">Values are in each chain's native coin. "Value at floor" = NFTs held × floor price. Floor is shown next to the median of recent sales, because one cheap listing can make the floor misleading.</p>
+    ${d.collections.length ? `<div class="table-wrap"><table>
+      <tr><th>Collection</th><th class="num">Held</th><th class="num">Floor</th><th class="num">Recent sales</th><th class="num">24 h</th><th>7-day floor</th><th class="num">Value</th><th class="num">Spent</th><th class="num">Received</th><th class="num">P&amp;L</th></tr>
+      ${d.collections.map((c) => `<tr><td>${esc(c.name || c.slug)}<div class="tiny muted">${esc(c.slug)}</div></td><td class="num">${c.held}</td><td class="num">${fmtN(c.floor)}</td><td class="num">${fmtN(c.sales_median)}</td>
+        <td class="num" style="color:${(c.change_24h || 0) < 0 ? "var(--bad)" : "var(--good)"}">${c.change_24h === null ? "—" : `${c.change_24h.toFixed(1)}%`}</td>
+        <td>${spark(c.history)}</td><td class="num">${fmtN(c.value)}</td><td class="num">${fmtN(c.spent)}</td><td class="num">${fmtN(c.received)}</td>
+        <td class="num"><b style="color:${(c.pnl || 0) < 0 ? "var(--bad)" : "var(--good)"}">${fmtN(c.pnl)}</b></td></tr>`).join("")}</table></div>`
+      : `<div class="panel empty">Nothing yet. Click “Update from OpenSea”.</div>`}`;
+}
+
+const PAGE_RENDER = { overview: renderOverview, wallets: renderWallets, collections: renderCollections, eligibility: renderEligibility, mint: renderMint, transfers: renderTransfers, contracts: renderContracts, offers: renderOffers, portfolio: renderPortfolio, history: renderHistory, networks: renderNetworks, settings: renderSettings };
 
 // ---------------------------------------------------------------- actions
 const ACTIONS = {
@@ -1308,6 +1471,41 @@ const ACTIONS = {
     const a = Object.assign(document.createElement("a"), { href: url, download: name }); document.body.append(a); a.click(); a.remove(); URL.revokeObjectURL(url);
     closeModal(); toast(`Saved ${name}`);
   })),
+  "of-scan": (el) => guard(() => withBusy(el, "Scanning…", async () => { const r = await api("/api/offers/scan", { sync: true }); toast(`Checked ${r.offers} offers in ${r.collections} collections`); render(); })),
+  "of-export": () => download("/api/offers/log.csv", "offers-report.csv"),
+  "of-rules": (el) => openRules(el.dataset.slug),
+  "of-rules-save": (el) => guard(async () => {
+    const f = $("#rules-form"), slug = el.dataset.slug, rules = {};
+    for (const [k, v] of Object.entries(RULE_FIELDS)) {
+      const input = f.elements[k]; if (!input) continue;
+      rules[k] = v.type === "bool" ? input.checked : input.value;
+    }
+    rules.optional = [...f.querySelectorAll("[data-optional]:checked")].map((x) => x.dataset.optional);
+    try { rules.overrides = JSON.parse(f.elements.overrides.value || "[]"); } catch { throw new ApiError("Custom rules must be valid JSON"); }
+    await api("/api/offers/rules", { slug, rules }); closeModal(); toast("Rules saved"); render();
+  }),
+  "of-arm": (el) => modal(`<h2>Switch on automatic acceptance — ${esc(el.dataset.slug)}</h2>
+    <div class="notice warn">In Full mode, offers that pass every rule for this collection will be accepted and your NFTs sold without asking you. Limits, STOP and automatic pauses still apply.</div>
+    <label>Type AUTO-ACCEPT to switch it on<input id="arm-text" autocomplete="off"></label>
+    <div class="row"><span class="spacer"></span><button data-action="close">Cancel</button><button class="primary" data-action="of-arm-go" data-slug="${esc(el.dataset.slug)}">Switch on</button></div>`),
+  "of-arm-go": (el) => guard(async () => { await api("/api/offers/control", { slug: el.dataset.slug, action: "arm", confirm: $("#arm-text").value }); closeModal(); toast("Automatic acceptance armed"); render(); }),
+  "of-ctl": (el) => guard(async () => { await api("/api/offers/control", { slug: el.dataset.slug, action: el.dataset.ctl }); render(); }),
+  "of-approve": (el) => guard(async () => {
+    const p = await api("/api/offers/approval", { chain_id: Number(el.dataset.chain), wallet: el.dataset.wallet, contract: el.dataset.contract, operator: el.dataset.operator });
+    p.created = Date.now() / 1000; S.tx.preview = p; modal(txPreviewHTML(p) + `<div class="row"><span class="spacer"></span><button data-action="close">Close</button></div>`);
+  }),
+  "of-accept": (el) => { S.ofSelected = new Set([el.dataset.key]); openAccept(); },
+  "of-accept-many": () => { if (!S.ofSelected || !S.ofSelected.size) return toast("Tick the offers to accept first", true); openAccept(); },
+  "of-accept-go": (el) => guard(() => withBusy(el, "Checking and sending…", async () => {
+    const items = [...S.ofSelected].map((k) => { const [order_hash, contract, token_id, wallet] = k.split("|"); return { order_hash, contract, token_id, wallet }; });
+    const r = await api("/api/offers/accept", { items, confirm: $("#accept-text").value });
+    closeModal(); S.ofSelected = new Set();
+    const ok = r.results.filter((x) => x.status === "accepted").length;
+    toast(`${ok} accepted, ${r.results.length - ok} skipped${r.results.find((x) => x.status !== "accepted") ? ` — ${r.results.find((x) => x.status !== "accepted").reason}` : ""}`, ok === 0);
+    render();
+  })),
+  "pf-refresh": (el) => guard(() => withBusy(el, "Updating from OpenSea…", async () => { await api("/api/portfolio/refresh", {}); render(); })),
+  "os-key": () => guard(async () => { await api("/api/opensea/key", { key: $("#os-key").value }); $("#os-key").value = ""; toast("OpenSea API key saved (encrypted in your vault)"); render(); }),
   "cc-pick": (el) => { S.mint.slug = el.dataset.slug; S.mint.stage = el.dataset.stage; S.mint.preview = null; render(); },
   "mint-selected": () => { S.mint.source = "selected"; S.mint.preview = null; go("mint"); },
   "col-refresh": (el) => guard(async () => { await api("/api/collections", { locator: el.dataset.slug }); toast("Refreshed"); render(); }),

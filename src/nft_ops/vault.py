@@ -169,6 +169,7 @@ class Vault:
             _check_password(new)
             self.unlock(old)
             raw_keys = {a: bytes.fromhex(self._raw_hex(a)) for a in self._signers}
+            saved = {n: self.get_secret(n) for n in (self._data or {}).get("secrets", {})}
             salt = secrets.token_bytes(16)
             aes = AESGCM(_derive(new, salt, SCRYPT_N, SCRYPT_R, SCRYPT_P))
             nonce = secrets.token_bytes(12)
@@ -180,6 +181,7 @@ class Vault:
                 "verifier": {"nonce": _b64(nonce),
                              "ct": _b64(aes.encrypt(nonce, _VERIFIER_PLAINTEXT, b"verifier"))},
                 "keys": {a: self._encrypt_entry(aes, a, k) for a, k in raw_keys.items()},
+                "secrets": {n: self._encrypt_secret(aes, n, v) for n, v in saved.items() if v},
             }
             self._write(data)
             self._data, self._aes = data, aes
@@ -219,6 +221,40 @@ class Vault:
                     removed += 1
             self._write(self._data)
             return removed
+
+    # ----- other secrets (e.g. the OpenSea API key) ----------------------------------------
+    def set_secret(self, name: str, value: str) -> None:
+        with self._lock:
+            self._require_unlocked()
+            assert self._data is not None and self._aes is not None
+            store = self._data.setdefault("secrets", {})
+            if value:
+                store[name] = self._encrypt_secret(self._aes, name, value)
+            else:
+                store.pop(name, None)
+            self._write(self._data)
+
+    def get_secret(self, name: str) -> str | None:
+        with self._lock:
+            if self._aes is None or self._data is None:
+                return None
+            entry = self._data.get("secrets", {}).get(name)
+            if entry is None:
+                return None
+            try:
+                return self._aes.decrypt(_unb64(entry["nonce"]), _unb64(entry["ct"]),
+                                         b"secret:" + name.encode()).decode()
+            except InvalidTag:
+                raise VaultError(f"stored secret {name} is corrupted") from None
+
+    def has_secret(self, name: str) -> bool:
+        with self._lock:
+            return bool(self._data and name in self._data.get("secrets", {}))
+
+    @staticmethod
+    def _encrypt_secret(aes: AESGCM, name: str, value: str) -> dict[str, str]:
+        nonce = secrets.token_bytes(12)
+        return {"nonce": _b64(nonce), "ct": _b64(aes.encrypt(nonce, value.encode(), b"secret:" + name.encode()))}
 
     # ----- internals -------------------------------------------------------------------
     def _raw_hex(self, address: str) -> str:

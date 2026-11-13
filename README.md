@@ -197,6 +197,46 @@ transaction. Add a second RPC link for each network you mint on (**Networks → 
   the Contracts page. Fill bundled inputs as a JSON list; `{wallet}`, `{quantity}`, `{proof}`,
   `{price_wei}` and `{native}` placeholders work inside it.
 
+## Offer Manager (auto-accept) and Portfolio
+
+Needs an **OpenSea API key** (Settings → OpenSea & offers; stored encrypted in your vault).
+
+The **Offers** page watches offers on every NFT in every registered wallet (collection offers,
+offers on a single NFT, and trait offers when the NFT's traits are known), across all enabled
+networks OpenSea supports. For every offer it shows: gross offer → OpenSea fee → creator earnings
+→ gas → **what you receive**, with a ✓/✗ list of every check and the reason.
+
+- **Fees are read from the offer itself** (its Seaport order), so the OpenSea fee and any creator
+  earnings are exactly what will be paid. On Robinhood Chain that is 1% OpenSea fee; optional
+  creator earnings are not added.
+- **Default rules** (Default rules button; each collection can override them):
+  minimum = **95% of floor**; what you receive must be **≥ 100% of that minimum** after all fees
+  and gas; **pause** automatic acceptance if the floor **falls more than 10%** within 60 minutes
+  or drifts more than 50% from recent sales; stablecoin offers (e.g. USDG on Robinhood) are
+  accepted, converted at OpenSea's rate minus a 1% safety margin; at most 10 sales and 5 ETH per
+  collection per 24 h; at most 3 at the same time. A collection can use a **fixed** minimum or
+  **floor + premium** instead, and custom rules can target a token, trait, wallet, offer type or
+  currency.
+- **Execution modes**: *Safe* (recommend only), *Semi* (you click Accept and type `ACCEPT`),
+  *Full* (automatic). Full is the default mode, but a collection only sells automatically after
+  you **Arm** it and type `AUTO-ACCEPT`. Switch it off any time.
+- **One-time approval**: before an offer can be accepted, each wallet must allow OpenSea's
+  Seaport transfer contract to move NFTs of that collection. The Offers page shows an **Approve**
+  button; it goes through the normal preview and you type `APPROVE`. It covers only that
+  collection in that wallet and can be revoked.
+- **Before every sale** (manual or automatic) everything is checked again with fresh data:
+  offer still valid, NFT still yours, approval, floor, fees, your rules, and OpenSea's
+  transaction is verified — it must be exactly the offer that was evaluated, the only thing
+  leaving your wallet must be that one NFT, and the payment to you must match — then it is
+  simulated on-chain. Anything that fails is skipped with the reason. An NFT is never sold twice,
+  STOP blocks everything, and 3 failures in a row pause the collection.
+- **Activity** and **Export CSV** record every accepted, skipped and failed offer with gross,
+  fees, gas, net, floor, transaction and reason.
+
+The **Portfolio** page shows, per collection: NFTs held, floor next to the median of recent
+sales, 24-hour change, a 7-day floor chart, value at floor, what you spent minting, what you
+received from sales, and profit/loss.
+
 ## Auto-lock
 
 The vault locks itself after 30 minutes without activity (change it or turn it off in Settings).

@@ -27,6 +27,8 @@ from osnm_z.opensea_protocol import (
 from osnm_z.seadrop import OPENSEA_SEADROP_ADDRESS
 
 CHAIN_ID = 4663
+SEAPORT_FAKE = "0x0000000000000068f116a894984e2db1123eb395"
+CONTROLLER_FAKE = "0x00000000f9490004c11cef243f5400493c00ad63"
 NFT = "0x93DAF9D3dd4b35D165A7a8Bcfc598437af6f5c2B"
 TRANSFER = keccak(text="Transfer(address,address,uint256)")
 PRICE = 10**15  # 0.001 ETH
@@ -50,6 +52,8 @@ class FakeChain:
     supply: dict[str, tuple[int, int]] = field(default_factory=dict)  # contract -> (total, max)
     down_ports: set[int] = field(default_factory=set)   # simulate dead RPC endpoints
     custom: dict = field(default_factory=dict)   # address -> CustomDrop (non-SeaDrop mint contract)
+    approvals: dict = field(default_factory=dict)  # (contract, owner, operator) -> bool
+    custom_seaport: object = None                  # FakeOpenSeaAPI, when offer tests run
     calls_by_port: dict[int, int] = field(default_factory=dict)
     sends_by_port: dict[int, int] = field(default_factory=dict)
     mining: bool = True                                   # False = transactions stay pending
@@ -145,6 +149,14 @@ class FakeChain:
             self.sent.append({"from": sender, "hash": tx_hash, "to": to, "value": value, "data": data})
             if to.lower() == OPENSEA_SEADROP_ADDRESS.lower():
                 return self._mint_receipt(sender, tx_hash)
+            if self.custom_seaport is not None and to.lower() == SEAPORT_FAKE:
+                problem = self.custom_seaport.execute(sender, data, dry=False)
+                self.balances[sender] -= 200_000 * self.gas_price
+                self.receipts[tx_hash] = {
+                    "transactionHash": tx_hash, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x101",
+                    "status": "0x0" if problem else "0x1", "logs": [], "gasUsed": hex(200_000),
+                    "effectiveGasPrice": hex(self.gas_price)}
+                return tx_hash
             if to.lower() in self.custom:
                 drop = self.custom[to.lower()]
                 problem = drop.check(sender, value, data)
@@ -175,6 +187,11 @@ class FakeChain:
             sender = call.get("from", "").lower()
             data = bytes.fromhex(call.get("data", "0x")[2:])
             value = int(call.get("value", "0x0"), 16)
+            if self.custom_seaport is not None and call["to"].lower() == SEAPORT_FAKE:
+                problem = self.custom_seaport.execute(sender, data, dry=True)
+                if problem:
+                    raise ValueError(f"execution reverted: {problem}")
+                return hex(200_000)
             if call["to"].lower() == OPENSEA_SEADROP_ADDRESS.lower():
                 raise ValueError("not supported by fake chain")
             if self.balances.get(sender, 0) < value:
@@ -275,6 +292,13 @@ def _call_impl(self: FakeChain, call: dict) -> str:
     data = bytes.fromhex(call.get("data", call.get("input", "0x"))[2:])
     if to in self.custom:
         return self.custom[to].read(data[:4].hex())
+    if self.custom_seaport is not None:
+        if to == SEAPORT_FAKE:
+            out = self.custom_seaport.seaport_call(data)
+            if out:
+                return out
+        if to == CONTROLLER_FAKE:
+            return self.custom_seaport.controller_call(data)
     sel, args = data[:4].hex(), data[4:]
     word = lambda n: args[32 * n: 32 * n + 32]
     if sel == "01ffc9a7":  # supportsInterface
@@ -288,6 +312,8 @@ def _call_impl(self: FakeChain, call: dict) -> str:
             return "0x" + self.erc20[to].get(owner, 0).to_bytes(32, "big").hex()
         count = sum(1 for o in self.erc721.get(to, {}).values() if o == owner)
         return "0x" + count.to_bytes(32, "big").hex()
+    if sel == "e985e9c5":  # isApprovedForAll(owner, operator)
+        return "0x" + int(bool(self.approvals.get((to, _addr(word(0)), _addr(word(1)))))).to_bytes(32, "big").hex()
     if sel == "6352211e":  # ownerOf
         owner = self.erc721.get(to, {}).get(_u(word(0)))
         if owner is None:
@@ -328,6 +354,11 @@ def _apply_impl(self: FakeChain, sender: str, to: str, value: int, data: bytes, 
         if not dry:
             book[sender] -= amount
             book[recipient.lower()] = book.get(recipient.lower(), 0) + amount
+        return True
+    if sel == "a22cb465" and to in self.erc721:        # setApprovalForAll(operator, approved)
+        operator, approved = decode(["address", "bool"], args)
+        if not dry:
+            self.approvals[(to, sender, operator.lower())] = approved
         return True
     if sel == "42842e0e" and to in self.erc721:
         frm, recipient, token_id = decode(["address", "address", "uint256"], args)

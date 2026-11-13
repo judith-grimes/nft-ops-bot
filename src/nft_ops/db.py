@@ -154,6 +154,85 @@ CREATE TABLE IF NOT EXISTS alerts (
     message     TEXT NOT NULL,
     read        INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS os_holdings (
+    chain_id    INTEGER NOT NULL,
+    address     TEXT NOT NULL,          -- owner wallet
+    contract    TEXT NOT NULL,
+    token_id    TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    name        TEXT,
+    standard    TEXT,
+    quantity    TEXT NOT NULL DEFAULT '1',
+    traits      TEXT,                   -- JSON list or NULL when unknown
+    image_url   TEXT,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (chain_id, address, contract, token_id)
+);
+CREATE TABLE IF NOT EXISTS floor_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug          TEXT NOT NULL,
+    ts            REAL NOT NULL,
+    floor_native  REAL,                 -- NULL when there is no listing
+    floor_symbol  TEXT,
+    sales_median  REAL,                 -- median sale price (native) over the sales window
+    sales_count   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS floor_history_slug ON floor_history(slug, ts);
+CREATE TABLE IF NOT EXISTS market_collections (
+    slug        TEXT PRIMARY KEY,
+    chain_id    INTEGER,
+    contract    TEXT,
+    name        TEXT,
+    info        TEXT,                   -- JSON: fees, pricing currencies
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS offer_rules (
+    slug        TEXT PRIMARY KEY,       -- '*' = defaults for every collection
+    rules       TEXT NOT NULL,          -- JSON
+    armed       INTEGER NOT NULL DEFAULT 0,
+    armed_at    REAL,
+    paused      TEXT,                   -- reason, NULL when not paused
+    paused_at   REAL,
+    fail_streak INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS offers_current (
+    order_hash  TEXT NOT NULL,
+    chain_id    INTEGER NOT NULL,
+    contract    TEXT NOT NULL,
+    token_id    TEXT NOT NULL,
+    wallet      TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    evaluation  TEXT NOT NULL,          -- JSON
+    qualifies   INTEGER NOT NULL DEFAULT 0,
+    net_native  REAL,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (order_hash, contract, token_id, wallet)
+);
+CREATE TABLE IF NOT EXISTS offer_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            REAL NOT NULL,
+    slug          TEXT,
+    nft_name      TEXT,
+    contract      TEXT,
+    token_id      TEXT,
+    wallet        TEXT,
+    offerer       TEXT,
+    order_hash    TEXT,
+    offer_type    TEXT,
+    currency      TEXT,
+    gross         TEXT,                 -- in offer currency
+    gross_native  REAL,
+    market_fee    REAL,                 -- native
+    creator_fee   REAL,
+    gas_native    REAL,
+    net_native    REAL,
+    floor_native  REAL,
+    tx_hash       TEXT,
+    status        TEXT NOT NULL,        -- accepted | failed | skipped | rejected | pending | awaiting
+    reason        TEXT,
+    mode          TEXT
+);
+CREATE INDEX IF NOT EXISTS offer_log_ts ON offer_log(ts);
 CREATE TABLE IF NOT EXISTS settings (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -179,6 +258,9 @@ class Database:
         for column in ("watch INTEGER NOT NULL DEFAULT 1", "snapshot TEXT", "next_check REAL"):
             if column.split()[0] not in cols:
                 self._conn.execute(f"ALTER TABLE collections ADD COLUMN {column}")
+        logcols = {r[1] for r in self._conn.execute("PRAGMA table_info(offer_log)").fetchall()}
+        if "chain_id" not in logcols:
+            self._conn.execute("ALTER TABLE offer_log ADD COLUMN chain_id INTEGER")
         have = {r[1] for r in self._conn.execute("PRAGMA table_info(history)").fetchall()}
         for column in ("asset TEXT", "token_id TEXT", "amount TEXT", "spend_wei TEXT"):
             if column.split()[0] not in have:
