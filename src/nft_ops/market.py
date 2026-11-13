@@ -145,13 +145,47 @@ def history(db: Database, slug: str, days: float = 7) -> list[dict]:
                   "ORDER BY ts", (slug, time.time() - days * 86400))
 
 
-def portfolio(db: Database) -> list[dict]:
-    """Per collection: what you hold, its value at floor, what you spent and received."""
+_USD: dict[int, tuple[float, float | None]] = {}     # chain_id -> (fetched_at, usd per native coin)
+USD_TTL = 600
+STABLES = {"USDC", "USDT", "USDG", "DAI", "USDC.E", "PYUSD"}
+
+
+async def native_usd(db: Database, api: OpenSeaAPI, chain_id: int) -> float | None:
+    """USD price of one native coin: OpenSea's payment-token price, else a stablecoin rate."""
+    hit = _USD.get(chain_id)
+    if hit and time.time() - hit[0] < USD_TTL:
+        return hit[1]
+    price = None
+    chain = CHAIN_SLUGS.get(chain_id)
+    if chain and api.configured:
+        try:
+            data = await api.payment_token(chain, "0x0000000000000000000000000000000000000000")
+            price = float(data.get("usd_price")) if data.get("usd_price") else None
+        except (OpenSeaError, ValueError, TypeError):
+            price = None
+    if price is None and native_symbol(db, chain_id).upper() == "ETH":
+        for row in db.all("SELECT info FROM market_collections WHERE chain_id = ?", (chain_id,)):
+            for token in (json.loads(row["info"]).get("pricing_currencies") or {}).values():
+                if (isinstance(token, dict) and (token.get("symbol") or "").upper() in STABLES
+                        and token.get("eth_price") and float(token["eth_price"]) > 0):
+                    price = 1 / float(token["eth_price"])
+                    break
+            if price:
+                break
+    _USD[chain_id] = (time.time(), price)
+    return price
+
+
+def portfolio(db: Database, wallet: str | None = None) -> list[dict]:
+    """Per collection: what you hold, its value at floor, what you spent and received.
+    With ``wallet``, only that wallet's holdings, spending and sales are counted."""
     out = []
+    hw, hargs = ("WHERE address = ?", (wallet,)) if wallet else ("", ())
     holdings = db.all("SELECT slug, chain_id, contract, COUNT(*) AS n, MAX(name) AS name FROM os_holdings "
-                      "GROUP BY slug, chain_id, contract")
+                      f"{hw} GROUP BY slug, chain_id, contract", hargs)
+    lw, largs = (" AND wallet = ?", (wallet,)) if wallet else ("", ())
     slugs = {h["slug"] for h in holdings} | {r["slug"] for r in db.all(
-        "SELECT DISTINCT slug FROM offer_log WHERE status = 'accepted' AND slug IS NOT NULL")}
+        f"SELECT DISTINCT slug FROM offer_log WHERE status = 'accepted' AND slug IS NOT NULL{lw}", largs)}
     for slug in sorted(slugs):
         h = next((x for x in holdings if x["slug"] == slug), None)
         snap = latest(db, slug)
@@ -160,14 +194,15 @@ def portfolio(db: Database) -> list[dict]:
         spent = 0.0
         if contract:
             for r in db.all("SELECT value_wei, gas_cost_wei, operation, slug, asset FROM history "
-                            "WHERE status = 'confirmed' AND operation IN ('mint', 'custom_mint')"):
+                            "WHERE status = 'confirmed' AND operation IN ('mint', 'custom_mint')"
+                            + (" AND address = ?" if wallet else ""), (wallet,) if wallet else ()):
                 if r["operation"] == "mint" and r["slug"] != slug:
                     continue
                 if r["operation"] == "custom_mint" and (r["asset"] or "").lower() != f"erc721:{contract}".lower():
                     continue
                 spent += int(r["value_wei"] or 0) / 1e18 + int(r["gas_cost_wei"] or 0) / 1e18
         sold = db.one("SELECT COUNT(*) AS n, COALESCE(SUM(net_native), 0) AS net FROM offer_log "
-                      "WHERE slug = ? AND status = 'accepted'", (slug,))
+                      f"WHERE slug = ? AND status = 'accepted'{lw}", (slug, *largs))
         held = h["n"] if h else 0
         value = floor * held if floor is not None else None
         out.append({

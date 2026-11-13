@@ -20,6 +20,7 @@ import time
 from typing import Any
 
 from eth_utils.address import to_checksum_address
+
 from osnm_z.transaction import Eip1559Transaction, sign_eip1559_transaction
 
 from . import market, seaport
@@ -470,14 +471,19 @@ class OfferEngine:
                        data=seaport.approval_calldata(to_checksum_address(operator), approve))]
 
     # ----- dashboard --------------------------------------------------------------------
-    def dashboard(self) -> dict:
+    def dashboard(self, wallet: str | None = None) -> dict:
+        """All offers, or only those on one wallet's NFTs (``wallet``)."""
         rows = []
         for r in self.db.all("SELECT evaluation FROM offers_current ORDER BY net_native DESC"):
             e = json.loads(r["evaluation"])
             e.pop("raw", None)
+            if wallet and (e.get("wallet") or "").lower() != wallet.lower():
+                continue
             rows.append(e)
-        slugs = sorted({r["slug"] for r in self.db.all("SELECT DISTINCT slug FROM os_holdings")}
-                       | {r["slug"] for r in self.db.all("SELECT slug FROM offer_rules WHERE slug != '*'")})
+        held = self.db.all("SELECT DISTINCT slug FROM os_holdings" + (" WHERE address = ?" if wallet else ""),
+                           (wallet,) if wallet else ())
+        slugs = sorted({r["slug"] for r in held} | (set() if wallet else {
+            r["slug"] for r in self.db.all("SELECT slug FROM offer_rules WHERE slug != '*'")}))
         collections = []
         for slug in slugs:
             st = self.state(slug)
@@ -488,8 +494,11 @@ class OfferEngine:
                                 "fail_streak": st["fail_streak"], "floor": snap["floor_native"] if snap else None,
                                 "sales_median": snap["sales_median"] if snap else None,
                                 "today_count": count, "today_value": value,
-                                "held": self.db.one("SELECT COUNT(*) AS n FROM os_holdings WHERE slug = ?", (slug,))["n"]})
-        log = self.db.all("SELECT * FROM offer_log ORDER BY id DESC LIMIT 200")
+                                "held": self.db.one("SELECT COUNT(*) AS n FROM os_holdings WHERE slug = ?"
+                                                    + (" AND address = ?" if wallet else ""),
+                                                    (slug, wallet) if wallet else (slug,))["n"]})
+        log = self.db.all("SELECT * FROM offer_log" + (" WHERE wallet = ?" if wallet else "")
+                          + " ORDER BY id DESC LIMIT 200", (wallet,) if wallet else ())
         q = [r for r in rows if r["qualifies"]]
         best_per_nft: dict = {}
         for r in rows:
@@ -508,4 +517,8 @@ class OfferEngine:
             "offers": rows, "best": [r["order_hash"] + ":" + r["token_id"] for r in best_per_nft.values()],
             "collections": collections, "defaults": rules_for(self.db, "*"), "log": log,
             "last_scan": self.last_scan, "api_key": self.api.configured, "settings": self.settings(),
+            "wallets": self.db.all("SELECT h.address, COALESCE(w.label, '') AS label, COUNT(*) AS nfts "
+                                   "FROM os_holdings h LEFT JOIN wallets w ON w.address = h.address "
+                                   "GROUP BY h.address ORDER BY w.label, h.address"),
+            "wallet": wallet,
         }

@@ -268,7 +268,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
 
     @app.get("/static/{name}")
     async def static(name: str) -> FileResponse:
-        if name not in {"app.js", "stage6.js", "ui65.js", "style.css", "icon.svg"}:
+        if name not in {"app.js", "stage6.js", "ui65.js", "ui651.js", "style.css", "icon.svg"}:
             raise KeyError("not found")
         return FileResponse(STATIC / name)
 
@@ -719,8 +719,11 @@ def create_app(state: AppState, port: int) -> FastAPI:
         return ok(configured=bool(key))
 
     @app.get("/api/offers")
-    async def offers_dashboard() -> dict:
-        return state.offers.dashboard()
+    async def offers_dashboard(wallet: str = "") -> dict:
+        d = state.offers.dashboard(checksum(wallet) if wallet else None)
+        d["usd"] = {str(c): await market.native_usd(state.db, state.opensea, c)
+                    for c in {o.get("chain_id") for o in d["offers"] if o.get("chain_id")}}
+        return d
 
     @app.post("/api/offers/scan")
     async def offers_scan(request: Request) -> dict:
@@ -783,11 +786,21 @@ def create_app(state: AppState, port: int) -> FastAPI:
         return _csv_response(_to_csv(rows, cols), "offers-report.csv")
 
     @app.get("/api/portfolio")
-    async def portfolio() -> dict:
-        rows = market.portfolio(state.db)
+    async def portfolio(wallet: str = "") -> dict:
+        rows = market.portfolio(state.db, checksum(wallet) if wallet else None)
+        usd: dict[str, float | None] = {}
         for r in rows:
             r["history"] = market.history(state.db, r["slug"], 7)
-        return {"collections": rows, "api_key": state.opensea.configured}
+            if r["chain_id"] and str(r["chain_id"]) not in usd:
+                usd[str(r["chain_id"])] = await market.native_usd(state.db, state.opensea, r["chain_id"])
+            price = usd.get(str(r["chain_id"])) if r["chain_id"] else None
+            for k in ("floor", "sales_median", "value", "spent", "received", "pnl"):
+                r[f"{k}_usd"] = None if price is None or r[k] is None else r[k] * price
+        wallets = state.db.all("SELECT h.address, COALESCE(w.label, '') AS label, COUNT(*) AS nfts "
+                               "FROM os_holdings h LEFT JOIN wallets w ON w.address = h.address "
+                               "GROUP BY h.address ORDER BY w.label, h.address")
+        return {"collections": rows, "api_key": state.opensea.configured, "usd": usd,
+                "wallets": wallets, "wallet": wallet or None}
 
     @app.post("/api/portfolio/refresh")
     async def portfolio_refresh() -> dict:

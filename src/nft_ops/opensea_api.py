@@ -9,6 +9,7 @@ limits) and retried with back-off on HTTP 429. Only documented endpoints are use
   GET  /offers/collection/{slug}/all             all offers on a collection
   GET  /offers/collection/{slug}/nfts/{id}       offers on one NFT
   GET  /chain/{chain}/account/{address}/nfts     NFTs a wallet holds
+  GET  /chain/{chain}/payment_token/{address}    token price in USD (native coin = 0x0)
   POST /offers/fulfillment_data                  Seaport transaction to accept an offer
 """
 
@@ -127,6 +128,10 @@ class OpenSeaAPI:
     async def nfts(self, chain: str, address: str, max_pages: int = 10) -> list[dict]:
         return await self._pages(f"/chain/{chain}/account/{address}/nfts", "nfts",
                                  {"limit": 200}, max_pages)
+
+    async def payment_token(self, chain: str, address: str) -> dict:
+        """GET /chain/{chain}/payment_token/{address}: symbol, decimals, usd_price, eth_price."""
+        return await self._request("GET", f"/chain/{chain}/payment_token/{address}")
 
     async def fulfillment(self, order_hash: str, chain: str, protocol_address: str, fulfiller: str,
                           contract: str, token_id: str) -> dict:

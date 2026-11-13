@@ -9,6 +9,7 @@
   <script src="/static/app.js" defer></script>
   <script src="/static/stage6.js" defer></script>
   <script src="/static/ui65.js" defer></script>
+  <script src="/static/ui651.js" defer></script>
 </head>
 <body>
   <div id="lock" class="lock hidden">
@@ -30,22 +31,21 @@
       <nav id="nav">
         <div class="nav-group">Workspace</div>
         <a data-page="overview" class="" title="Overview"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/></svg><span class="lbl">Overview</span></a>
-        <a data-page="calendar" class="" title="Mint calendar"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg><span class="lbl">Mint calendar</span></a>
         <div class="nav-group">NFT operations</div>
         <a data-page="eligibility" class="" title="Eligibility"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg><span class="lbl">Eligibility</span></a>
-        <a data-page="collections" class="sub" title="Collections"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span class="lbl">Collections</span></a>
         <a data-page="mint" class="" title="Mint"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span class="lbl">Mint</span></a>
-        <a data-page="schedules" class="sub" title="Scheduled mints"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span class="lbl">Scheduled mints</span></a>
+        <div class="nav-sub">
+        <a data-page="schedules" class="sub" title="Scheduled mints"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span class="lbl">Scheduled mints</span> <span class="nav-count hidden" id="nav-count-schedules"></span></a>
+        </div>
         <div class="nav-group">Wallet management</div>
         <a data-page="wallets" class="" title="Wallets"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="14" rx="2"/><path d="M16 13h2M3 10h18M6 6V4h12v2"/></svg><span class="lbl">Wallets</span></a>
         <a data-page="transfers" class="" title="Transfers"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h13l-3-3M17 17H4l3 3"/></svg><span class="lbl">Transfers</span></a>
-        <a data-page="portfolio" class="" title="Portfolio"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20h18M6 16l4-5 3 3 5-7"/></svg><span class="lbl">Portfolio</span></a>
-        <div class="nav-group">Market operations</div>
         <a data-page="offers" class="" title="Offers"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12l-8 8-9-9V3h8z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg><span class="lbl">Offers</span></a>
-        <a data-page="contracts" class="" title="Contracts"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg><span class="lbl">Contracts</span></a>
+        <a data-page="portfolio" class="" title="Portfolio"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20h18M6 16l4-5 3 3 5-7"/></svg><span class="lbl">Portfolio</span></a>
         <div class="nav-group">Activity</div>
         <a data-page="history" class="" title="History"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg><span class="lbl">History</span></a>
         <a data-page="notifications" class="" title="Notifications"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10 21h4"/></svg><span class="lbl">Notifications</span> <span class="nav-count hidden" id="nav-count-notifications"></span></a>
+        <a data-page="calendar" class="" title="Mint calendar"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg><span class="lbl">Mint calendar</span></a>
         <div class="nav-group">Configuration</div>
         <a data-page="networks" class="" title="Networks"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v5M12 12l-6 5M12 12l6 5"/></svg><span class="lbl">Networks</span></a>
         <a data-page="settings" class="" title="Settings"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9 4.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg><span class="lbl">Settings</span></a>
