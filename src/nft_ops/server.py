@@ -48,15 +48,18 @@ from .collections import CollectionError, OpenSeaFactory, default_opensea_factor
 from .contracts import ContractError
 from .db import Database
 from .events import EventBus
-from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
+from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams, params_from
 from .monitor import Monitor
 from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
 from .nfts import NftError
+from .notify import Notifier
 from .offers import OfferEngine, OfferError
 from .opensea_api import OpenSeaAPI, OpenSeaError
 from .os_signin import SHARED_LIMITER
+from .recovery import reconcile_pending, recover_interrupted
 from .replace import ReplaceError, Replacer
 from .safety import LIMIT_LABELS, Safety, from_wei
+from .scheduler import ScheduleError, Scheduler
 from .seaport import SeaportError
 from .txengine import TxEngine, TxEngineError
 from .vault import Vault, VaultError
@@ -65,7 +68,7 @@ from .wallets import WalletError, WalletService, checksum, safe_cell
 STATIC = Path(__file__).parent / "static"
 USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
                ContractError, ReplaceError, backup.BackupError, OfferError, OpenSeaError,
-               SeaportError,
+               SeaportError, ScheduleError,
                RpcError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
@@ -77,6 +80,7 @@ class AppState:
                  opensea_api: OpenSeaAPI | None = None) -> None:
         self.db = Database(data_dir / "nft-ops.db")
         seed_networks(self.db)
+        self.recovered = recover_interrupted(self.db)       # audit C1: honest records after a restart
         self.vault = Vault(data_dir / "vault.json")
         self.bus = EventBus()
         self.safety = Safety(self.db, self.bus)
@@ -99,11 +103,37 @@ class AppState:
         self.mint.external_busy = self.tx.busy_sources.get
         SHARED_LIMITER.on_pause = lambda seconds: self.bus.publish("signin_pause", seconds=round(seconds))
         self.monitor = Monitor(self.db, self.pool, self.bus, self.opensea_factory, self.auto_rescan)
+        self.notifier = Notifier(self.db, self.bus)
+        self.scheduler = Scheduler(self.db, self.mint, self.notifier, self.vault, self.safety,
+                                   self._task_wallets, self._task_rescan)
+        self.mint.on_job_done = self.scheduler.job_finished
+        self.scheduler.recover()
+        if self.recovered["jobs"]:
+            r = self.recovered
+            self.notifier.send("system", "warn", "Operations interrupted",
+                               f"NFT Ops was closed while {r['jobs']} operation(s) were running. "
+                               f"{r['not_sent']} wallet(s) had not sent anything; {r['in_flight']} "
+                               "transaction(s) were already sent and are being checked on-chain.",
+                               link="history")
+
+    def _task_wallets(self, task: dict) -> list[str]:
+        src = task["wallet_source"]
+        return self.wallets.resolve_selection(
+            json.loads(task["addresses"] or "[]") if src == "addresses" else None,
+            task["group_name"] if src == "group" else None)
+
+    async def _task_rescan(self, slug: str, addresses: list[str]) -> None:
+        settings = self.db.get_setting("eligibility", {}) or {}
+        await eligibility.scan(self.db, self.opensea_factory, self.vault, collections.get(self.db, slug),
+                               addresses, concurrency=int(settings.get("concurrency", 2)),
+                               spacing_seconds=float(settings.get("spacing_seconds", 1.0)),
+                               should_stop=lambda: self.safety.stopped)
 
     def busy(self) -> bool:
         """Anything running that must not be interrupted by an automatic lock."""
         return bool(self.mint.active_wallets or self.tx.busy_sources or self.offers.locks
-                    or (self.scan_task and not self.scan_task.done()))
+                    or (self.scan_task and not self.scan_task.done())
+                    or self.scheduler.has_armed())      # audit H6: a waiting task must be able to sign
 
     def auto_lock_minutes(self) -> int:
         return int((self.db.get_setting("security", {}) or {}).get("auto_lock_minutes", 30))
@@ -157,9 +187,24 @@ def create_app(state: AppState, port: int) -> FastAPI:
                     pass
         lock_task = asyncio.create_task(lock_loop())
         offers_task = asyncio.create_task(state.offers.run_forever())
+
+        async def schedule_loop() -> None:
+            last_reconcile = 0.0
+            while True:
+                try:
+                    await state.scheduler.tick()
+                    if time.time() - last_reconcile >= 60:
+                        last_reconcile = time.time()
+                        await reconcile_pending(state.db, state.pool,
+                                                [*state.mint.jobs, *state.tx.jobs])
+                except Exception:  # noqa: BLE001, S110 - the scheduler loop must never die
+                    pass
+                await asyncio.sleep(5)
+        schedule_task = asyncio.create_task(schedule_loop())
         try:
             yield
         finally:
+            schedule_task.cancel()
             task.cancel()
             monitor_task.cancel()
             lock_task.cancel()
@@ -538,18 +583,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
     @app.post("/api/mint/preview")
     async def mint_preview(request: Request) -> dict:
         data = await body(request)
-        defaults = {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})}
-        params = MintParams(
-            slug=str(data["slug"]), stage_index=int(data["stage_index"]),
-            addresses=selection(data), quantity=int(data.get("quantity", 1)),
-            gas_limit=int(data.get("gas_limit") or defaults["gas_limit"]),
-            fee_mode=str(data.get("fee_mode") or defaults["fee_mode"]),
-            max_fee_gwei=str(data.get("max_fee_gwei") or defaults["max_fee_gwei"] or ""),
-            priority_fee_gwei=str(data.get("priority_fee_gwei") or defaults["priority_fee_gwei"] or ""),
-            public_offset_ms=int(data.get("public_offset_ms") or defaults["public_offset_ms"]),
-            operation_cap=str(data.get("operation_cap") or ""),
-            pending_timeout_seconds=int(defaults["pending_timeout_seconds"]),
-        )
+        params = params_from(data, selection(data), state.db.get_setting("mint", {}) or {})
         return await state.mint.preview(params)
 
     @app.post("/api/mint/start")
@@ -750,6 +784,48 @@ def create_app(state: AppState, port: int) -> FastAPI:
     async def alerts_read() -> dict:
         state.monitor.mark_read()
         return ok()
+
+    # ----- notifications ---------------------------------------------------------------
+    @app.get("/api/notifications")
+    async def notifications_list(category: str = "", unread: int = 0) -> dict:
+        return state.notifier.list(category or None, bool(unread))
+
+    @app.post("/api/notifications/read")
+    async def notifications_read(request: Request) -> dict:
+        data = await body(request)
+        state.notifier.mark_read([int(i) for i in data.get("ids") or []] or None)
+        return ok()
+
+    # ----- scheduled mints --------------------------------------------------------------
+    @app.get("/api/schedules")
+    async def schedules_list() -> dict:
+        from .scheduler import MODES
+        return {"tasks": state.scheduler.list(), "modes": MODES,
+                "vault_unlocked": state.vault.unlocked}
+
+    @app.post("/api/schedules")
+    async def schedules_action(request: Request) -> dict:
+        data = await body(request)
+        action = str(data.get("action") or "")
+        sched = state.scheduler
+        if action == "create":
+            return ok(id=sched.create(data))
+        tid = int(data["id"])
+        if action == "update":
+            sched.update(tid, data)
+        elif action == "pause":
+            sched.pause(tid)
+        elif action == "resume":
+            sched.resume(tid)
+        elif action == "cancel":
+            sched.cancel(tid)
+        elif action == "check":
+            await sched.precheck(tid)
+        elif action == "confirm":
+            return ok(job_id=await sched.confirm(tid))
+        else:
+            raise ValueError("unknown action")
+        return ok(task=sched.get(tid))
 
     @app.post("/api/collections/watch")
     async def collections_watch(request: Request) -> dict:
