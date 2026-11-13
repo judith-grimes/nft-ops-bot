@@ -203,7 +203,14 @@ function onEvent(ev) {
   if (ev.kind === "eligibility" && S.page === "eligibility") {
     const bar = $("#scan-bar"); if (bar) { bar.style.width = `${(100 * ev.done) / ev.total}%`; $("#scan-text").textContent = `${ev.done} / ${ev.total} wallets checked`; }
   }
-  if (ev.kind === "eligibility_done") { toast("Eligibility scan finished"); if (S.page === "eligibility") render(); }
+  if (ev.kind === "signin_pause") {
+    const t = $("#scan-text"); if (t) t.textContent = `OpenSea asked us to slow down — waiting ${ev.seconds}s before the next sign-in…`;
+  }
+  if (ev.kind === "eligibility_done") {
+    if (ev.rate_limited) toast("Scan stopped: OpenSea is rate limiting sign-ins. Wallets not reached are marked UNKNOWN — wait a few minutes and scan again.", true);
+    else toast("Eligibility scan finished");
+    if (S.page === "eligibility") render();
+  }
 }
 function scheduleRefresh() {
   if (refreshTimer) return;
@@ -399,7 +406,8 @@ async function renderEligibility() {
         <button class="primary" data-action="scan" ${scanning ? "disabled" : ""}>Scan eligibility</button>
       </div>
       <div style="margin-top:10px;${scanning ? "" : "display:none"}"><div class="progress"><div id="scan-bar" style="width:${p.total ? (100 * p.done) / p.total : 0}%"></div></div>
-        <div class="tiny muted" id="scan-text">${p.done || 0} / ${p.total || 0} wallets checked</div></div>
+        <div class="tiny muted" id="scan-text">${p.done || 0} / ${p.total || 0} wallets checked${d.signin && d.signin.cooling_down_seconds ? ` — OpenSea asked us to slow down, waiting ${d.signin.cooling_down_seconds}s` : ""}</div></div>
+      ${!scanning && p.rate_limited && p.slug === S.elig.slug ? `<p class="tiny" style="color:var(--warn)">The last scan stopped early because OpenSea was rate limiting sign-ins. Wallets it did not reach show UNKNOWN — wait a few minutes, then scan again (or scan a smaller group).</p>` : ""}
       <p class="tiny muted">Each wallet signs in to OpenSea (a free signature, no transaction) and asks which phases it qualifies for.
         <b>ELIGIBLE</b> = OpenSea confirmed. <b>UNKNOWN</b> = could not get an answer (try again), not “ineligible”. <b>UNVERIFIED</b> = watch-only wallet, could not ask.
         Balances and gas are checked separately in the Mint preview.</p>

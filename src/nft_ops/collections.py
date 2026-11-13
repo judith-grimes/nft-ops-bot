@@ -9,7 +9,6 @@ from collections.abc import Callable
 from typing import Any
 
 from osnm_z.config import OpenSeaConfig
-from osnm_z.opensea import WalletOpenSeaClient
 from osnm_z.opensea_protocol import (
     CollectionMetadata,
     ProtocolError,
@@ -23,8 +22,11 @@ from .db import Database
 OpenSeaFactory = Callable[[], Any]  # returns a WalletOpenSeaClient-compatible object
 
 
-def default_opensea_factory(config: OpenSeaConfig | None = None) -> OpenSeaFactory:
-    return lambda: WalletOpenSeaClient(config or OpenSeaConfig())
+def default_opensea_factory(config: OpenSeaConfig | None = None, limiter: Any = None) -> OpenSeaFactory:
+    """Clients share one sign-in queue (see os_signin) and retry slowly (2 s, not 0.25 s)."""
+    from .os_signin import SHARED_LIMITER, PacedOpenSeaClient
+    cfg = config or OpenSeaConfig(retry_interval_ms=2000)
+    return lambda: PacedOpenSeaClient(cfg, limiter or SHARED_LIMITER)
 
 
 class CollectionError(Exception):

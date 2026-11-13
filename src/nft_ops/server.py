@@ -35,11 +35,11 @@ from . import (
     addressbook,
     backup,
     balances,
-    market,
     collections,
     contracts,
     custommint,
     eligibility,
+    market,
     nfts,
     transfers,
 )
@@ -54,9 +54,10 @@ from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
 from .nfts import NftError
 from .offers import OfferEngine, OfferError
 from .opensea_api import OpenSeaAPI, OpenSeaError
+from .os_signin import SHARED_LIMITER
 from .replace import ReplaceError, Replacer
-from .seaport import SeaportError
 from .safety import LIMIT_LABELS, Safety, from_wei
+from .seaport import SeaportError
 from .txengine import TxEngine, TxEngineError
 from .vault import Vault, VaultError
 from .wallets import WalletError, WalletService, checksum, safe_cell
@@ -96,6 +97,7 @@ class AppState:
         # A wallet can be in a mint or a transfer operation, never both (nonce safety).
         self.tx.external_busy = self.mint.active_wallets.get
         self.mint.external_busy = self.tx.busy_sources.get
+        SHARED_LIMITER.on_pause = lambda seconds: self.bus.publish("signin_pause", seconds=round(seconds))
         self.monitor = Monitor(self.db, self.pool, self.bus, self.opensea_factory, self.auto_rescan)
 
     def busy(self) -> bool:
@@ -127,8 +129,8 @@ class AppState:
             r["address"] for r in self.db.all("SELECT address FROM wallets WHERE has_key = 1")]
         settings = self.db.get_setting("eligibility", {}) or {}
         return await eligibility.scan(self.db, self.opensea_factory, self.vault, meta, addresses,
-                                      concurrency=int(settings.get("concurrency", 3)),
-                                      spacing_seconds=float(settings.get("spacing_seconds", 0.3)),
+                                      concurrency=int(settings.get("concurrency", 2)),
+                                      spacing_seconds=float(settings.get("spacing_seconds", 1.0)),
                                       should_stop=lambda: self.safety.stopped)
 
 
@@ -471,7 +473,8 @@ def create_app(state: AppState, port: int) -> FastAPI:
         meta = await collections.load(state.db, state.opensea_factory, slug, None)
         addresses = selection(data)
         settings = state.db.get_setting("eligibility", {}) or {}
-        state.scan_progress = {"slug": slug, "total": len(addresses), "done": 0, "running": True}
+        state.scan_progress = {"slug": slug, "total": len(addresses), "done": 0, "running": True,
+                               "rate_limited": False}
 
         def on_result(address: str, results: list) -> None:
             state.scan_progress["done"] += 1
@@ -483,10 +486,12 @@ def create_app(state: AppState, port: int) -> FastAPI:
             try:
                 counts = await eligibility.scan(
                     state.db, state.opensea_factory, state.vault, meta, addresses,
-                    concurrency=int(settings.get("concurrency", 3)),
-                    spacing_seconds=float(settings.get("spacing_seconds", 0.3)),
+                    concurrency=int(settings.get("concurrency", 2)),
+                    spacing_seconds=float(settings.get("spacing_seconds", 1.0)),
                     on_result=on_result, should_stop=lambda: state.safety.stopped)
-                state.bus.publish("eligibility_done", slug=slug, counts=counts)
+                state.scan_progress["rate_limited"] = bool(counts.pop("rate_limited", False))
+                state.bus.publish("eligibility_done", slug=slug, counts=counts,
+                                  rate_limited=state.scan_progress["rate_limited"])
             finally:
                 state.scan_progress["running"] = False
         state.scan_task = asyncio.create_task(run())
@@ -496,7 +501,8 @@ def create_app(state: AppState, port: int) -> FastAPI:
     async def eligibility_list(slug: str) -> dict:
         meta = collections.get(state.db, slug)
         return {"rows": eligibility.table(state.db, slug, meta),
-                "collection": collections.describe(meta), "progress": state.scan_progress}
+                "collection": collections.describe(meta), "progress": state.scan_progress,
+                "signin": SHARED_LIMITER.status()}
 
     @app.get("/api/eligibility.csv")
     async def eligibility_csv(slug: str) -> PlainTextResponse:
@@ -554,7 +560,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
                 "network": {"broadcast_all": bool((state.db.get_setting("network", {}) or {})
                                                   .get("broadcast_all", True))},
                 "mint": {**DEFAULT_MINT_SETTINGS, **(state.db.get_setting("mint", {}) or {})},
-                "eligibility": {"concurrency": 3, "spacing_seconds": 0.3,
+                "eligibility": {"concurrency": 2, "spacing_seconds": 1.0,
                                 **(state.db.get_setting("eligibility", {}) or {})}}
 
     @app.post("/api/settings")
@@ -590,7 +596,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
             state.db.set_setting("network", {"broadcast_all": bool(data["network"].get("broadcast_all", True))})
         if "eligibility" in data:
             e = data["eligibility"]
-            concurrency, spacing = int(e.get("concurrency", 3)), float(e.get("spacing_seconds", 0.3))
+            concurrency, spacing = int(e.get("concurrency", 2)), float(e.get("spacing_seconds", 1.0))
             if not 1 <= concurrency <= 10 or not 0 <= spacing <= 10:
                 raise ValueError("eligibility concurrency 1-10, spacing 0-10 seconds")
             state.db.set_setting("eligibility", {"concurrency": concurrency,

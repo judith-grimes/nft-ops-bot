@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from osnm_z.errors import MintError
+from osnm_z.hooks import LOG_SINK
 from osnm_z.opensea_protocol import (
     CollectionMetadata,
     EligibilitySnapshot,
@@ -34,6 +35,7 @@ from osnm_z.phase_selection import (
 
 from .collections import OpenSeaFactory
 from .db import Database
+from .os_signin import is_rate_limited
 from .vault import Vault
 
 SOURCE_OPENSEA = "OpenSea eligibility (wallet signed in)"
@@ -100,23 +102,37 @@ def classify(metadata: CollectionMetadata, snapshot: EligibilitySnapshot | None,
     return results
 
 
+RATE_LIMITED_DETAIL = "OpenSea rate limited - try again later"
+RATE_LIMIT_STOP_AFTER = 3     # consecutive rate-limited wallets before the scan stops
+
+
 async def check_wallet(metadata: CollectionMetadata, factory: OpenSeaFactory, vault: Vault,
                        address: str) -> list[StageResult]:
+    results, _ = await check_wallet_detail(metadata, factory, vault, address)
+    return results
+
+
+async def check_wallet_detail(metadata: CollectionMetadata, factory: OpenSeaFactory, vault: Vault,
+                              address: str) -> tuple[list[StageResult], bool]:
+    """Check one wallet. Returns (results, rate_limited)."""
     has_key = vault.unlocked and vault.has(address)
     needs_signin = any(s.stage_type != "PUBLIC_SALE" for s in metadata.stages)
-    snapshot, error = None, None
+    snapshot, error, limited = None, None, False
     if has_key and needs_signin:
         client = factory()
+        token = LOG_SINK.set(lambda *_: None)   # retry chatter stays off the console
         try:
             await client.authenticate(vault.signer(address), address, metadata.network_id,
                                       metadata.slug)
             snapshot = await client.eligibility(metadata.slug, address)
             validate_snapshot_shape(metadata, snapshot)
         except (ProtocolError, MintError) as exc:
-            snapshot, error = None, str(exc)
+            limited = is_rate_limited(exc)
+            snapshot, error = None, RATE_LIMITED_DETAIL if limited else str(exc)
         finally:
+            LOG_SINK.reset(token)
             await client.aclose()
-    return classify(metadata, snapshot, error, has_key)
+    return classify(metadata, snapshot, error, has_key), limited
 
 
 def save(db: Database, slug: str, address: str, results: list[StageResult]) -> None:
@@ -133,28 +149,47 @@ def save(db: Database, slug: str, address: str, results: list[StageResult]) -> N
 
 
 async def scan(db: Database, factory: OpenSeaFactory, vault: Vault, metadata: CollectionMetadata,
-               addresses: list[str], *, concurrency: int = 3, spacing_seconds: float = 0.3,
+               addresses: list[str], *, concurrency: int = 2, spacing_seconds: float = 1.0,
                on_result: Callable[[str, list[StageResult]], None] | None = None,
                should_stop: Callable[[], bool] = lambda: False) -> dict:
-    """Check many wallets with bounded concurrency so OpenSea is not flooded."""
+    """Check many wallets with bounded concurrency so OpenSea is not flooded.
+
+    Sign-ins also pass through the process-wide queue in os_signin. If OpenSea keeps
+    answering "too many requests", the scan stops and the wallets it did not reach are
+    marked UNKNOWN (rate limited) instead of being retried over and over.
+    """
     semaphore = asyncio.Semaphore(max(1, concurrency))
     counts = {"ELIGIBLE": 0, "NOT_ELIGIBLE": 0, "UNKNOWN": 0, "UNVERIFIED": 0}
     start_gate = asyncio.Lock()
+    state = {"streak": 0, "halted": False}
+
+    def record(address: str, results: list[StageResult]) -> None:
+        save(db, metadata.slug, address, results)
+        for r in results:
+            counts[r.status] = counts.get(r.status, 0) + 1
+        if on_result:
+            on_result(address, results)
 
     async def one(address: str) -> None:
         async with semaphore:
             async with start_gate:  # space out sign-ins
                 if should_stop():
                     return
-                await asyncio.sleep(spacing_seconds)
-            results = await check_wallet(metadata, factory, vault, address)
-            save(db, metadata.slug, address, results)
-            for r in results:
-                counts[r.status] = counts.get(r.status, 0) + 1
-            if on_result:
-                on_result(address, results)
+                if not state["halted"]:
+                    await asyncio.sleep(spacing_seconds)
+            if state["halted"]:
+                has_key = vault.unlocked and vault.has(address)
+                record(address, classify(metadata, None, RATE_LIMITED_DETAIL, has_key))
+                return
+            results, limited = await check_wallet_detail(metadata, factory, vault, address)
+            state["streak"] = state["streak"] + 1 if limited else 0
+            if state["streak"] >= RATE_LIMIT_STOP_AFTER:
+                state["halted"] = True
+            record(address, results)
 
     await asyncio.gather(*(one(a) for a in addresses))
+    if state["halted"]:
+        counts["rate_limited"] = True
     return counts
 
 
