@@ -121,14 +121,17 @@ async def check_wallet_detail(metadata: CollectionMetadata, factory: OpenSeaFact
     if has_key and needs_signin:
         client = factory()
         token = LOG_SINK.set(lambda *_: None)   # retry chatter stays off the console
+        step = "sign-in"
         try:
             await client.authenticate(vault.signer(address), address, metadata.network_id,
                                       metadata.slug)
+            step = "eligibility answer"
             snapshot = await client.eligibility(metadata.slug, address)
+            step = "phase check"
             validate_snapshot_shape(metadata, snapshot)
         except (ProtocolError, MintError) as exc:
             limited = is_rate_limited(exc)
-            snapshot, error = None, RATE_LIMITED_DETAIL if limited else str(exc)
+            snapshot, error = None, RATE_LIMITED_DETAIL if limited else f"{step}: {exc}"
         finally:
             LOG_SINK.reset(token)
             await client.aclose()

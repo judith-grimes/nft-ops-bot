@@ -22,10 +22,20 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
+from eth_utils.address import is_address
+
 from osnm_z.config import DEFAULT_OPENSEA_ATTEMPTS, OpenSeaConfig
+from osnm_z.domain import ZERO_ADDRESS
 from osnm_z.hooks import emit
-from osnm_z.opensea import WalletOpenSeaClient
-from osnm_z.opensea_protocol import ErrorKind, ProtocolError, is_retryable_request_error
+from osnm_z.opensea import ELIGIBILITY_QUERY, WalletOpenSeaClient
+from osnm_z.opensea_protocol import (
+    EligibilitySnapshot,
+    ErrorKind,
+    ProtocolError,
+    decode_eligibility,
+    is_retryable_request_error,
+    validate_slug,
+)
 
 T = TypeVar("T")
 
@@ -92,6 +102,34 @@ class SignInLimiter:
 SHARED_LIMITER = SignInLimiter()
 
 
+def drop_non_evm_wallets(data: object) -> object:
+    """Make an eligibility answer readable when the OpenSea account has non-EVM wallets linked.
+
+    An OpenSea account can link Solana (or other non-EVM) wallets. The eligibility answer then
+    lists those addresses next to the EVM ones, and osnm-z rejects the whole answer
+    ("OpenSea returned an invalid address ..."). A non-EVM wallet can never mint an EVM drop,
+    so its entries are removed; a stage whose eligible minter is a non-EVM address is treated
+    as "a different linked wallet is eligible, not this one". Nothing else is changed, and the
+    data is a fresh copy.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("dropBySlug"), dict):
+        return data
+    drop = dict(data["dropBySlug"])
+    account = drop.get("accountStageEligibility")
+    if isinstance(account, dict) and isinstance(account.get("wallets"), list):
+        drop["accountStageEligibility"] = {**account, "wallets": [
+            w for w in account["wallets"]
+            if not (isinstance(w, dict) and isinstance(w.get("address"), str)
+                    and not is_address(w["address"]))]}
+    if isinstance(drop.get("stages"), list):
+        drop["stages"] = [
+            {**st, "eligibleMinterAddress": ZERO_ADDRESS}
+            if isinstance(st, dict) and isinstance(st.get("eligibleMinterAddress"), str)
+            and not is_address(st["eligibleMinterAddress"]) else st
+            for st in drop["stages"]]
+    return {**data, "dropBySlug": drop}
+
+
 class PacedOpenSeaClient(WalletOpenSeaClient):
     def __init__(self, config: OpenSeaConfig, limiter: SignInLimiter) -> None:
         super().__init__(config)
@@ -127,3 +165,11 @@ class PacedOpenSeaClient(WalletOpenSeaClient):
                 self._limiter.succeeded()
             return result
         raise AssertionError("bounded OpenSea retry loop did not return")
+
+    async def _eligibility_once(self, slug: str, wallet: str) -> EligibilitySnapshot:
+        # Same request as osnm-z; only the answer is cleaned of non-EVM linked wallets first.
+        self._require_session(wallet)
+        validate_slug(slug)
+        data = await self._graphql("DropEligibilityQuery", ELIGIBILITY_QUERY,
+                                   {"address": wallet.lower(), "collectionSlug": slug}, slug)
+        return decode_eligibility(drop_non_evm_wallets(data), wallet)

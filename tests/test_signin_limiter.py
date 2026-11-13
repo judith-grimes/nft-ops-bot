@@ -113,3 +113,33 @@ def test_scan_keeps_going_when_rate_limits_are_not_consecutive(env):
         assert "rate_limited" not in counts
         assert counts["ELIGIBLE"] == 2 and counts["UNKNOWN"] == 2
     asyncio.run(run())
+
+
+def _answer(wallet: str, linked: str) -> dict:
+    uuid = "stage-1"
+    return {"dropBySlug": {
+        "__typename": "Erc721SeaDropV1", "minterQuantityMinted": 0,
+        "accountStageEligibility": {"wallets": [
+            {"address": wallet.lower(), "quantityMinted": 0, "stages": [
+                {"dropStageUuid": uuid, "isEligible": True, "maxTotalMintableByWallet": 2, "price": None}]},
+            {"address": linked, "quantityMinted": 0, "stages": []}]},
+        "stages": [{"__typename": "Erc721SeaDropV1Stage", "uuid": uuid, "stageType": "SIGNED_PRESALE",
+                    "stageIndex": 1, "isEligible": True, "eligibleMinterAddress": linked,
+                    "maxTotalMintableByWallet": 2, "eligibleMaxTotalMintableByWallet": 2,
+                    "eligiblePrice": None}]}}
+
+
+def test_linked_solana_wallet_no_longer_breaks_eligibility():
+    from nft_ops.os_signin import drop_non_evm_wallets
+    from osnm_z.opensea_protocol import decode_eligibility
+    wallet = "0x7b7db1358895d2C746bbf3E7A416757957B67C7F"
+    solana = "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV"
+    raw = _answer(wallet, solana)
+    try:
+        decode_eligibility(raw, wallet)                  # what osnm-z does on its own
+        raise AssertionError("expected the upstream decoder to reject the Solana address")
+    except ProtocolError as error:
+        assert error.kind is ErrorKind.INVALID_PROTOCOL_VALUE
+    snap = decode_eligibility(drop_non_evm_wallets(raw), wallet)
+    assert snap.stages[0].is_eligible is True and snap.stages[0].eligible_max_total_mintable_by_wallet == 2
+    assert raw["dropBySlug"]["accountStageEligibility"]["wallets"][1]["address"] == solana  # input untouched
