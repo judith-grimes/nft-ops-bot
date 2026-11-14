@@ -19,7 +19,7 @@ import uvicorn
 sys.path.insert(0, str(Path(__file__).parent))
 from conftest import Env
 from fake_opensea_api import WETH, FakeOffer, FakeOpenSeaAPI
-from fakes import CustomDrop, FakeOpenSea, allowlist_metadata
+from fakes import CustomDrop, FakeOpenSea, FakeScatter, allowlist_metadata
 
 from nft_ops.opensea_api import OpenSeaAPI
 
@@ -55,6 +55,11 @@ def main() -> None:
     metadata = allowlist_metadata(time.time() + delay, time.time() + 3600)
     custom = "0x4444444444444444444444444444444444444444"
     env.chain.custom[custom] = CustomDrop(custom, sale_start=time.time() + float(os.environ.get("DEMO_SALE_DELAY", "0")))
+    sc = FakeScatter("0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c")   # Scatter (Archetype) drop
+    sc.invites[(0).to_bytes(32, "big")] = {"price": 2 * 10**15, "start": int(time.time()) + 600, "end": 0,
+                                           "limit": 3, "max_supply": 500}
+    sc.invites[bytes.fromhex("ab" * 32)] = {"price": 10**15, "start": 0, "end": 0, "limit": 1, "max_supply": 100}
+    env.chain.custom[sc.address] = sc
     env.chain.mining = os.environ.get("DEMO_NO_MINING") != "1"   # 1 = transactions stay pending
     # Simulated OpenSea offers: every wallet that asks gets two NFTs with offers on them.
     nft = "0x7777777777777777777777777777777777777777"

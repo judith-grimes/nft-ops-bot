@@ -215,6 +215,15 @@ CREATE TABLE IF NOT EXISTS os_trades (
     ts          REAL NOT NULL,
     PRIMARY KEY (tx_hash, token_id, address, side)
 );
+CREATE TABLE IF NOT EXISTS scatter_proofs (
+    chain_id    INTEGER NOT NULL,
+    contract    TEXT NOT NULL,
+    key         TEXT NOT NULL,          -- phase key = allowlist Merkle root
+    address     TEXT NOT NULL,
+    proof       TEXT NOT NULL,          -- JSON list of 0x hashes, verified against the root
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (chain_id, contract, key, address)
+);
 CREATE TABLE IF NOT EXISTS os_holdings (
     chain_id    INTEGER NOT NULL,
     address     TEXT NOT NULL,          -- owner wallet

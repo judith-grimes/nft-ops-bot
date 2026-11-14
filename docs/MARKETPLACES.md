@@ -1,4 +1,9 @@
-# Other marketplaces' drops — research notes (for a future update)
+# Other marketplaces' drops
+
+**Status:** Scatter is supported since Stage 6.6 (`src/nft_ops/scatter.py`). Kalos is waiting for a
+contract address.
+
+## Research notes
 
 Goal: mint drops hosted outside OpenSea as smoothly as OpenSea drops, starting with
 **Scatter** and **Kalos**. Today these work through *Mint → Any contract*, which reads the

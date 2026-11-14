@@ -119,7 +119,7 @@ async function scheduleModal(prefill = {}) {
   draw();
 }
 
-function reportHTML(t) {
+function schedReportHTML(t) {
   const r = t.report, sym = symbol(t.chain_id);
   return `<h2>${esc(t.name)} — ${esc(r.status)}</h2>
     <p>${esc(r.summary)}</p>
@@ -165,7 +165,7 @@ Object.assign(ACTIONS_EXTRA, {
     if (!await askConfirm("Mint now?", `<p><b>${esc(t.name)}</b>: readiness is checked again, then the ready wallets mint (max ${esc(t.max_total)} ${esc(symbol(t.chain_id))}).</p>`, "Mint now")) return;
     const r = await api("/api/schedules", { action: "confirm", id: t.id }); toast(`Operation #${r.job_id} started`); render();
   }),
-  "sched-report": (el) => modal(reportHTML(taskById(el.dataset.id))),
+  "sched-report": (el) => modal(schedReportHTML(taskById(el.dataset.id))),
   "sched-ready": (el) => modal(readinessHTML(taskById(el.dataset.id))),
   "sched-edit": (el) => {
     const t = taskById(el.dataset.id);

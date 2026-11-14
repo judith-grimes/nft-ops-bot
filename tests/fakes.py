@@ -206,7 +206,11 @@ class FakeChain:
                 raise ValueError("execution reverted")
             return hex(21_000 if not data else 60_000)
         if method == "eth_getLogs":
-            return []
+            out = []
+            for drop in self.custom.values():
+                if hasattr(drop, "event_logs") and params[0].get("address", "").lower() == drop.address.lower():
+                    out += drop.event_logs()
+            return out
         if method == "eth_getCode":
             drop = self.custom.get(params[0].lower())
             return "0x" + drop.bytecode().hex() if drop else "0x"
@@ -291,7 +295,10 @@ def _call_impl(self: FakeChain, call: dict) -> str:
     to = call["to"].lower()
     data = bytes.fromhex(call.get("data", call.get("input", "0x"))[2:])
     if to in self.custom:
-        return self.custom[to].read(data[:4].hex())
+        drop = self.custom[to]
+        if hasattr(drop, "read_data"):
+            return drop.read_data(data)
+        return drop.read(data[:4].hex())
     if self.custom_seaport is not None:
         if to == SEAPORT_FAKE:
             out = self.custom_seaport.seaport_call(data)
@@ -495,6 +502,104 @@ class CustomDrop:
     def mint(self, sender: str, data: bytes, tx_hash: str) -> list[dict]:
         from eth_abi import decode as dec
         (qty,) = dec(["uint256"], data[4:36])
+        logs = []
+        for _ in range(qty):
+            self.total += 1
+            logs.append({"address": self.address, "data": "0x", "topics": [
+                "0x" + TRANSFER.hex(), "0x" + "00" * 32, "0x" + "00" * 12 + sender[2:],
+                "0x" + self.total.to_bytes(32, "big").hex()], "transactionHash": tx_hash})
+        return logs
+
+
+def _h(b: bytes) -> bytes:
+    from eth_utils.crypto import keccak
+    return keccak(b)
+
+
+@dataclass
+class FakeScatter:
+    """Archetype (Scatter) ERC-721A drop: invites keyed by bytes32; allowlist key = Merkle root."""
+
+    address: str
+    invites: dict = field(default_factory=dict)   # key bytes -> dict(price,start,end,limit,max_supply)
+    minted_by: dict = field(default_factory=dict)  # (wallet lower, key) -> n
+    total: int = 0
+    fee: int = 10**14                              # Scatter protocol fee on public mints
+
+    SIGS = ("mint((bytes32,bytes32[]),uint256,address,bytes,(address,uint128,uint256,uint256))",
+            "invites(bytes32)", "minted(address,bytes32)", "computeMintPayment(bytes32,uint256,bool)",
+            "computePrice(bytes32,uint256,bool)", "totalSupply()", "name()")
+
+    def bytecode(self) -> bytes:
+        out = b"\x60\x80\x60\x40\x52"
+        for sig in self.SIGS:
+            out += b"\x63" + _sel(sig) + b"\x14\x61\x00\x10\x57"
+        return out + b"\x00"
+
+    def event_logs(self) -> list[dict]:
+        topic = "0x" + _h(b"Invited(bytes32,bytes32)").hex()
+        return [{"address": self.address, "topics": [topic, "0x" + k.hex(), "0x" + "00" * 32], "data": "0x"}
+                for k in self.invites]
+
+    def _public(self, key: bytes) -> bool:
+        return int.from_bytes(key, "big") <= 0xFF
+
+    def cost(self, key: bytes, qty: int) -> int:
+        inv = self.invites[key]
+        return inv["price"] * qty + (self.fee * qty if self._public(key) else 0)
+
+    def read_data(self, data: bytes) -> str:
+        from eth_abi import decode as dec
+        from eth_abi import encode as enc
+        sel, args = data[:4], data[4:]
+        if sel == _sel("invites(bytes32)"):
+            (key,) = dec(["bytes32"], args)
+            inv = self.invites.get(key, {})
+            return "0x" + enc(["uint128", "uint32", "uint32", "uint32", "uint32", "uint32", "address", "bool"],
+                              [inv.get("price", 0), inv.get("start", 0), inv.get("end", 0), inv.get("limit", 0),
+                               inv.get("max_supply", 0), 1, "0x" + "00" * 20, False]).hex()
+        if sel == _sel("minted(address,bytes32)"):
+            who, key = dec(["address", "bytes32"], args)
+            return "0x" + enc(["uint256"], [self.minted_by.get((who.lower(), key), 0)]).hex()
+        if sel == _sel("computeMintPayment(bytes32,uint256,bool)"):
+            key, qty, _ = dec(["bytes32", "uint256", "bool"], args)
+            return "0x" + enc(["uint256", "uint256", "address", "uint256"],
+                              [0, self.cost(key, qty), "0x" + "00" * 20, qty]).hex()
+        if sel == _sel("totalSupply()"):
+            return "0x" + enc(["uint256"], [self.total]).hex()
+        if sel == _sel("name()"):
+            return "0x" + enc(["string"], ["Scatter Drop"]).hex()
+        raise ValueError("execution reverted")
+
+    def check(self, sender: str, value: int, data: bytes) -> str | None:
+        from eth_abi import decode as dec
+        if data[:4] != _sel(self.SIGS[0]):
+            return "unknown function"
+        (key, proof), qty, _aff, _sig, (_cur, _mc, max_native, _mt) = dec(
+            ["(bytes32,bytes32[])", "uint256", "address", "bytes", "(address,uint128,uint256,uint256)"], data[4:])
+        inv = self.invites.get(key)
+        if not inv:
+            return "MintNotYetStarted"
+        if inv["start"] and time.time() < inv["start"]:
+            return "MintNotYetStarted"
+        if not self._public(key):                    # independent Merkle check (sorted pairs)
+            h = _h(bytes.fromhex(sender[2:]))
+            for p in proof:
+                h = _h(h + p) if h <= p else _h(p + h)
+            if h != key:
+                return "WalletUnauthorizedToMint"
+        if self.minted_by.get((sender.lower(), key), 0) + qty > inv["limit"]:
+            return "NumberOfMintsExceeded"
+        cost = self.cost(key, qty)
+        if value != cost or cost > max_native:
+            return "InsufficientEthSent"
+        return None
+
+    def mint(self, sender: str, data: bytes, tx_hash: str) -> list[dict]:
+        from eth_abi import decode as dec
+        (key, _p), qty = dec(["(bytes32,bytes32[])", "uint256", "address", "bytes",
+                              "(address,uint128,uint256,uint256)"], data[4:])[:2]
+        self.minted_by[(sender.lower(), key)] = self.minted_by.get((sender.lower(), key), 0) + qty
         logs = []
         for _ in range(qty):
             self.total += 1

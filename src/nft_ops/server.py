@@ -53,7 +53,7 @@ from .mint import DEFAULT_MINT_SETTINGS, MintEngine, MintEngineError, MintParams
 from .monitor import Monitor
 from .networks import RpcError, RpcPool, seed_networks, validate_rpc_url
 from .nfts import NftError
-from . import aftermint, groups
+from . import aftermint, groups, scatter
 from .notify import Notifier
 from .offers import OfferEngine, OfferError
 from .opensea_api import OpenSeaAPI, OpenSeaError
@@ -70,7 +70,7 @@ from .wallets import WalletError, WalletService, checksum, safe_cell
 STATIC = Path(__file__).parent / "static"
 USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
                ContractError, ReplaceError, backup.BackupError, OfferError, OpenSeaError,
-               SeaportError, ScheduleError, groups.GroupError,
+               SeaportError, ScheduleError, groups.GroupError, scatter.ScatterError,
                RpcError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
@@ -276,7 +276,7 @@ def create_app(state: AppState, port: int) -> FastAPI:
 
     @app.get("/static/{name}")
     async def static(name: str) -> FileResponse:
-        if name not in {"app.js", "stage6.js", "ui65.js", "ui651.js", "ui652.js", "style.css", "icon.svg"}:
+        if name not in {"app.js", "stage6.js", "ui65.js", "ui651.js", "ui652.js", "ui66.js", "style.css", "icon.svg"}:
             raise KeyError("not found")
         return FileResponse(STATIC / name)
 
@@ -727,6 +727,32 @@ def create_app(state: AppState, port: int) -> FastAPI:
             int(data.get("gas_limit") or 0), bool(data.get("resimulate", True)),
             str(data.get("label", ""))[:30], float(data.get("wait_for_open_minutes") or 0))
         return await state.tx.preview("custom_mint", chain_id, items, "Custom mint",
+                                      str(data.get("cap") or ""), notes)
+
+    # ----- Scatter drops (Stage 6.6) ---------------------------------------------------
+    @app.post("/api/scatter/inspect")
+    async def scatter_inspect(request: Request) -> dict:
+        data = await body(request)
+        return await scatter.inspect(state.db, state.pool, int(data["chain_id"]), str(data["address"]))
+
+    @app.post("/api/scatter/allowlist")
+    async def scatter_allowlist(request: Request) -> dict:
+        data = await body(request)
+        mine = [r["address"] for r in state.db.all("SELECT address FROM wallets")]
+        return ok(**scatter.load_allowlist(state.db, int(data["chain_id"]), str(data["address"]),
+                                           str(data["key"]), str(data.get("text", "")), mine))
+
+    @app.post("/api/scatter/preview")
+    async def scatter_preview(request: Request) -> dict:
+        data = await body(request)
+        chain_id = int(data["chain_id"])
+        wallets = [a for a in selection(data) if state.vault.has(a)]
+        if not wallets:
+            raise ValueError("no selected wallet has a key")
+        items, notes, _info = await scatter.plan(state.db, state.pool, chain_id, str(data["address"]),
+                                                 str(data["key"]), int(data.get("quantity", 1)), wallets,
+                                                 bool(data.get("schedule")), int(data.get("gas_limit") or 0))
+        return await state.tx.preview("custom_mint", chain_id, items, "Scatter mint",
                                       str(data.get("cap") or ""), notes)
 
     # ----- OpenSea key, offers, portfolio --------------------------------------------------
