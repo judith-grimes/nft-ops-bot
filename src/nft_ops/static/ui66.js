@@ -85,7 +85,9 @@ async function drawScatterPanel(info) {
       ${info.events_ok ? "" : `<div class="notice warn">This RPC would not return the drop's phase history, so only public phases were found. Add another RPC on the Networks page if an allowlist phase is missing.</div>`}
       <div class="phases">${info.phases.map((p) => `<button class="phase-card ${p.key === S66.phase ? "on" : ""}" data-action="sc-phase" data-key="${p.key}">
         <span class="row" style="justify-content:space-between;align-items:center"><span class="t">${esc(p.name)}</span>${badge(p.state)}</span>
-        <span class="tiny muted">${p.public ? "Open to every wallet" : "Allowlist"} · ${p.native ? `${esc(weiToStr(p.price_wei))} ${esc(sym)}` : "paid in a token"} · max ${p.limit || "—"}/wallet</span>
+        ${p.unreadable ? `<span class="tiny" style="color:var(--warn)">This phase uses a contract format NFT Ops can't read yet.</span>` : `
+        <span class="tiny muted">${p.public ? "Open to every wallet" : "Allowlist"} · ${p.native ? `${esc(weiToStr(p.quoted_wei && !p.public ? p.price_wei : p.price_wei))} ${esc(sym)}` : "paid in a token"} · max ${p.limit || "—"}/wallet</span>
+        ${p.dutch ? `<span class="tiny muted">Dutch auction: starts at ${esc(weiToStr(p.price_wei))}, falls to ${esc(weiToStr(p.reserve_wei || "0"))} ${esc(sym)}${p.quoted_wei ? ` · now ${esc(weiToStr(p.quoted_wei))}` : ""}</span>` : ""}`}
         <span class="tiny muted">${p.start ? (p.state === "upcoming" ? `opens in ${countdown(p.start)}` : `opened ${esc(inTz(p.start, tz))}`) : "no start time"}${p.end ? ` · ends ${esc(inTz(p.end, tz))}` : ""}</span>
         ${p.public ? "" : `<span class="tiny ${p.proofs_loaded ? "up" : "muted"}">${p.proofs_loaded ? `${p.proofs_loaded} verified proof(s) loaded` : "allowlist not loaded yet"}</span>`}
       </button>`).join("") || `<div class="empty">No phases found on this contract yet.</div>`}</div>
@@ -97,8 +99,10 @@ async function drawScatterPanel(info) {
         <label>Quantity / wallet<input id="sc-qty" type="number" min="1" value="${esc(S66.qty)}" style="width:90px"></label>
         ${ph.state === "upcoming" ? `<label class="radio" style="align-self:center"><input type="checkbox" id="sc-sched" ${S66.schedule ? "checked" : ""}> Send at the start time</label>` : ""}
         <span class="spacer"></span>
-        <button class="primary" data-action="sc-preview" ${ph.native && ph.state !== "ended" ? "" : "disabled"}>Preview mint</button></div>
-      ${!ph.native ? `<div class="notice warn">This phase is paid in an ERC-20 token. That needs a token approval first and is not supported yet.</div>` : ""}
+        <button class="primary" data-action="sc-preview" ${ph.native && !ph.unreadable && ph.state !== "ended" ? "" : "disabled"}>Preview mint</button></div>
+      ${ph.unreadable ? `<div class="notice warn">NFT Ops could not read this phase's format. Send the contract address so support can be added.</div>`
+        : !ph.native ? `<div class="notice warn">This phase is paid in an ERC-20 token (${esc(short(ph.currency))}). That needs a token approval first and is not supported yet.</div>` : ""}
+      ${ph.dutch ? `<div class="notice info">Dutch auction: the price falls over time. The preview pays the current price; mint later for a lower price.</div>` : ""}
       ${ph.public ? "" : `<details ${ph.proofs_loaded ? "" : "open"} style="margin-top:12px"><summary>Load the allowlist for this phase</summary>
         <p class="tiny muted">Paste the full allowlist (all addresses, as the project published it) — NFT Ops rebuilds the Merkle tree and only accepts it if it matches the root stored in the contract. Or paste proofs as <span class="mono">address, 0xproof1 0xproof2 …</span> lines (each is checked too).</p>
         <textarea id="sc-list" rows="5" placeholder="0x… one per line, or a CSV export"></textarea>

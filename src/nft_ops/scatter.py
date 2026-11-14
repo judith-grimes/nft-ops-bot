@@ -40,7 +40,79 @@ SIG_PRICE = "computePrice(bytes32,uint256,bool)"
 SIG_TOTAL = "totalSupply()"
 SIG_NAME = "name()"
 INVITED_TOPIC = "0x" + keccak(text="Invited(bytes32,bytes32)").hex()
-INVITE_TYPES = ["uint128", "uint32", "uint32", "uint32", "uint32", "uint32", "address", "bool"]
+# Every `invites(bytes32)` getter layout found in Scatter's published source history
+# (guminc/contracts, contracts-archetype, archetype). Dynamic arrays are not returned by
+# public getters, so they do not appear. "dutch" layouts are Dutch-auction phases.
+LAYOUTS: list[tuple[str, list[str]]] = [
+    ("current", ["price", "start", "end", "limit", "max_supply", "unit", "token", "flag"]),
+    ("supply-first", ["price", "max_supply", "limit", "start", "end", "unit", "token", "flag"]),
+    ("no-flag", ["price", "start", "end", "limit", "max_supply", "unit", "token"]),
+    ("randomize", ["price", "start", "end", "limit", "max_supply", "unit", "flag", "token"]),
+    ("staking", ["price", "start", "end", "limit", "max_supply", "unit", "other", "token"]),
+    ("no-unit", ["price", "start", "end", "limit", "max_supply", "token"]),
+    ("no-unit-randomize", ["price", "start", "end", "limit", "max_supply", "flag", "token"]),
+    ("oldest", ["price", "start", "limit", "max_supply", "token"]),
+    ("dutch", ["price", "reserve", "delta", "start", "end", "limit", "max_supply", "interval", "unit", "token", "flag"]),
+    ("dutch-no-flag", ["price", "reserve", "delta", "start", "end", "limit", "max_supply", "interval", "unit", "token"]),
+    ("dutch-randomize", ["price", "reserve", "delta", "start", "end", "limit", "max_supply", "interval", "unit", "flag", "token"]),
+    ("dutch-supply-first", ["price", "reserve", "delta", "max_supply", "limit", "start", "end", "interval", "unit", "token", "flag"]),
+    ("dutch-staking", ["price", "reserve", "delta", "start", "end", "limit", "max_supply", "interval", "unit", "other", "token"]),
+    ("dutch-no-unit", ["price", "reserve", "delta", "start", "end", "limit", "max_supply", "interval", "token"]),
+    ("dutch-no-unit-randomize", ["price", "reserve", "delta", "start", "end", "limit", "max_supply", "interval", "flag", "token"]),
+    ("dutch-oldest", ["price", "reserve", "delta", "start", "limit", "max_supply", "interval", "token"]),
+]
+U32 = 2**32
+
+
+def decode_invite(raw: bytes, quoted: int | None) -> dict | None:
+    """Pick the layout that fits the returned words best; None if nothing plausible fits.
+
+    ``quoted`` is the contract's own computePrice(key, 1) answer, used to confirm the price
+    field (exact for fixed-price phases, between reserve and start price for Dutch auctions).
+    """
+    words = [int.from_bytes(raw[i:i + 32], "big") for i in range(0, len(raw) - len(raw) % 32, 32)]
+    best, best_score = None, -1e9
+    for name, fields in LAYOUTS:
+        if len(fields) != len(words):
+            continue
+        v = dict(zip(fields, words, strict=True))
+        score = 0.0
+        if v["price"] >= 2**128 or v.get("reserve", 0) >= 2**128:
+            continue
+        if v["token"] >= 2**160 or v.get("flag", 0) > 1:
+            continue
+        if any(v.get(f, 0) >= U32 for f in ("start", "end", "unit", "interval", "other")):
+            continue
+        if any(v.get(f, 0) >= 2**128 for f in ("limit", "max_supply")):
+            continue
+        for f in ("start", "end"):
+            t = v.get(f, 0)
+            score += 2 if t == 0 or 1_400_000_000 <= t <= 5_000_000_000 else -8
+        if v.get("end") and v.get("start") and v["end"] < v["start"]:
+            score -= 6
+        if v.get("unit", 1) <= 1000:
+            score += 1
+        if v["limit"] <= max(v["max_supply"], 1) or v["limit"] >= U32 - 1:
+            score += 1
+        if v["token"] == 0:
+            score += 1
+        elif v["token"] < 2**64:                      # a "token address" that is a small number
+            score -= 10
+        if quoted is not None:
+            if name.startswith("dutch"):
+                low = v.get("reserve", 0)
+                if low <= quoted <= max(v["price"], low) * 2 + 10**16:
+                    score += 3
+            elif quoted >= v["price"] and quoted - v["price"] <= max(v["price"] // 2, 10**15):
+                score += 3 if quoted == v["price"] else 2
+        if score > best_score:
+            best, best_score = (name, v), score
+    if best is None:
+        return None
+    name, v = best
+    return {"layout": name, "dutch": name.startswith("dutch"), "price": v["price"], "reserve": v.get("reserve"),
+            "start": v.get("start", 0), "end": v.get("end", 0), "limit": v["limit"], "max_supply": v["max_supply"],
+            "unit": v.get("unit", 1) or 1, "token": "0x" + v["token"].to_bytes(20, "big").hex()}
 DEFAULT_GAS = 300_000
 EIP1167 = re.compile(r"^0x363d3d373d3d3d363d73([0-9a-f]{40})5af43d82803e903d91602b57fd5bf3$")
 
@@ -165,17 +237,40 @@ async def inspect(db: Database, pool: RpcPool, chain_id: int, address: str, look
     keys |= {bytes.fromhex(r["key"][2:]) for r in db.all(
         "SELECT DISTINCT key FROM scatter_proofs WHERE chain_id = ? AND contract = ?", (chain_id, contract))}
     keys_list = sorted(keys)
+    n = len(keys_list)
     res = await pool.batch(chain_id, [_call(contract, sel(SIG_INVITES) + encode(["bytes32"], [k])) for k in keys_list]
+                           + [_call(contract, sel(SIG_PRICE) + encode(["bytes32", "uint256", "bool"], [k, 1, False]))
+                              for k in keys_list]
+                           + [_call(contract, sel(SIG_PAYMENT) + encode(["bytes32", "uint256", "bool"], [k, 1, False]))
+                              for k in keys_list]
                            + [_call(contract, sel(SIG_TOTAL)), _call(contract, sel(SIG_NAME))])
     total = _hex(res[-2])
     name_raw = _hex(res[-1])
     phases = []
     now = time.time()
-    for k, r in zip(keys_list, res[:-2], strict=True):
-        raw = _hex(r)
-        if not raw or len(raw) < 32 * 8:
+    for i, k in enumerate(keys_list):
+        raw = _hex(res[i])
+        if not raw or len(raw) < 32 * 5:
             continue
-        price, start, end, limit, max_supply, unit, token, blacklist = decode(INVITE_TYPES, raw[:256])
+        qp, pay = _hex(res[n + i]), _hex(res[2 * n + i])
+        quoted = int.from_bytes(qp[:32], "big") if qp else None
+        currency = None
+        if pay and len(pay) >= 128:                       # newest contracts state the currency directly
+            _c, native_value, currency, _t = decode(["uint256", "uint256", "address", "uint256"], pay[:128])
+            quoted = native_value if currency == ZERO else quoted
+        inv = decode_invite(raw, quoted)
+        if inv is None:
+            if any(raw):                                   # a phase exists but its format is unknown
+                phases.append({"key": "0x" + k.hex(), "public": is_public_key(k, ZERO), "unreadable": True,
+                               "price_wei": "0", "start": None, "end": None, "limit": 0, "max_supply": 0,
+                               "unit_size": 1, "currency": ZERO, "native": False, "blacklist": False,
+                               "state": "unknown", "name": "Unrecognised phase", "proofs_loaded": 0,
+                               "dutch": False, "reserve_wei": None, "quoted_wei": None, "layout": None})
+            continue
+        price, start, end, limit, max_supply, unit = (inv["price"], inv["start"], inv["end"], inv["limit"],
+                                                      inv["max_supply"], inv["unit"])
+        token = currency or inv["token"]
+        blacklist = False
         if not (price or start or end or limit or max_supply):
             continue                                       # empty slot: no phase under this key
         public = is_public_key(k, token)
@@ -186,6 +281,8 @@ async def inspect(db: Database, pool: RpcPool, chain_id: int, address: str, look
             "key": "0x" + k.hex(), "public": public, "price_wei": str(price), "start": start or None,
             "end": end or None, "limit": limit, "max_supply": max_supply, "unit_size": unit or 1,
             "currency": token, "native": int(token, 16) == 0, "blacklist": blacklist, "state": state,
+            "dutch": inv["dutch"], "reserve_wei": str(inv["reserve"]) if inv["reserve"] is not None else None,
+            "quoted_wei": str(quoted) if quoted is not None else None, "layout": inv["layout"],
             "name": "Public" if public else "Allowlist", "proofs_loaded": loaded})
     phases.sort(key=lambda p: (p["start"] or 0, not p["public"]))
     for i, p in enumerate(phases):
@@ -264,6 +361,8 @@ async def plan(db: Database, pool: RpcPool, chain_id: int, contract: str, key: s
     phase = next((p for p in info["phases"] if p["key"] == key.lower()), None)
     if phase is None:
         raise ScatterError("that phase was not found on the contract")
+    if phase.get("unreadable"):
+        raise ScatterError("this phase uses a contract format NFT Ops cannot read yet — send me the contract address")
     if not phase["native"]:
         raise ScatterError("this phase is paid in an ERC-20 token, which is not supported yet")
     if phase["state"] == "ended":

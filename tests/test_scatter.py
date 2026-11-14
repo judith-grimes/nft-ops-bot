@@ -86,3 +86,23 @@ def test_future_phase_needs_schedule(env):
         items, _notes, _ = await scatter.plan(env.db, env.pool, 4663, DROP, "0x" + "00" * 32, 1, w, True)
         assert items[0].scheduled_at and items[0].fixed_gas == scatter.DEFAULT_GAS
     asyncio.run(run())
+
+
+def test_old_version_dutch_layout_is_read_correctly(env):
+    """Older Scatter contracts (still live on Ethereum) return an 11-field DutchInvite."""
+    async def run():
+        w, drop, _root, _ = _setup(env)
+        drop.old = True
+        info = await scatter.inspect(env.db, env.pool, 4663, DROP)
+        assert info["is_scatter"] and info["version"] == "v1"
+        pub = next(p for p in info["phases"] if p["public"])
+        assert pub["native"] is True                      # was misread as an ERC-20 token before
+        assert pub["limit"] == 3 and pub["max_supply"] == 100 and pub["price_wei"] == str(2 * 10**15)
+        tx = TxEngine(env.db, env.vault, env.pool, env.bus, env.safety)
+        items, notes, info2 = await scatter.plan(env.db, env.pool, 4663, DROP, pub["key"], 1, w[:1], False)
+        assert items[0].status == "READY" and int(info2["value"]) == 2 * 10**15
+        preview = await tx.preview("custom_mint", 4663, items, "Scatter", "", notes)
+        job = await tx.start(preview["token"], preview["confirm_word"])
+        await asyncio.wait_for(tx.jobs[job].task, 30)
+        assert drop.total == 1
+    asyncio.run(run())

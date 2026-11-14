@@ -525,14 +525,21 @@ class FakeScatter:
     minted_by: dict = field(default_factory=dict)  # (wallet lower, key) -> n
     total: int = 0
     fee: int = 10**14                              # Scatter protocol fee on public mints
+    old: bool = False                              # old version: DutchInvite getter, 4-arg mint, no fee
 
     SIGS = ("mint((bytes32,bytes32[]),uint256,address,bytes,(address,uint128,uint256,uint256))",
             "invites(bytes32)", "minted(address,bytes32)", "computeMintPayment(bytes32,uint256,bool)",
             "computePrice(bytes32,uint256,bool)", "totalSupply()", "name()")
 
+    def sigs(self):
+        if self.old:
+            return ("mint((bytes32,bytes32[]),uint256,address,bytes)", "invites(bytes32)", "minted(address,bytes32)",
+                    "computePrice(bytes32,uint256,bool)", "totalSupply()", "name()")
+        return self.SIGS
+
     def bytecode(self) -> bytes:
         out = b"\x60\x80\x60\x40\x52"
-        for sig in self.SIGS:
+        for sig in self.sigs():
             out += b"\x63" + _sel(sig) + b"\x14\x61\x00\x10\x57"
         return out + b"\x00"
 
@@ -545,13 +552,27 @@ class FakeScatter:
         return int.from_bytes(key, "big") <= 0xFF
 
     def cost(self, key: bytes, qty: int) -> int:
+        if key not in self.invites:
+            raise ValueError("execution reverted")
         inv = self.invites[key]
-        return inv["price"] * qty + (self.fee * qty if self._public(key) else 0)
+        return inv["price"] * qty + (self.fee * qty if self._public(key) and not self.old else 0)
 
     def read_data(self, data: bytes) -> str:
         from eth_abi import decode as dec
         from eth_abi import encode as enc
         sel, args = data[:4], data[4:]
+        if sel == _sel("invites(bytes32)") and self.old:      # DutchInvite getter (11 words)
+            (key,) = dec(["bytes32"], args)
+            inv = self.invites.get(key, {})
+            return "0x" + enc(["uint128", "uint128", "uint128", "uint32", "uint32", "uint32", "uint32", "uint32",
+                               "uint32", "address", "bool"],
+                              [inv.get("price", 0), inv.get("price", 0), 0, inv.get("start", 0), inv.get("end", 0),
+                               inv.get("limit", 0), inv.get("max_supply", 0), 0, 1, "0x" + "00" * 20, False]).hex()
+        if sel == _sel("computePrice(bytes32,uint256,bool)"):
+            key, qty, _ = dec(["bytes32", "uint256", "bool"], args)
+            return "0x" + enc(["uint256"], [self.cost(key, qty)]).hex()
+        if sel == _sel("computeMintPayment(bytes32,uint256,bool)") and self.old:
+            raise ValueError("execution reverted")
         if sel == _sel("invites(bytes32)"):
             (key,) = dec(["bytes32"], args)
             inv = self.invites.get(key, {})
@@ -571,12 +592,19 @@ class FakeScatter:
             return "0x" + enc(["string"], ["Scatter Drop"]).hex()
         raise ValueError("execution reverted")
 
-    def check(self, sender: str, value: int, data: bytes) -> str | None:
+    def _args(self, data: bytes):
         from eth_abi import decode as dec
-        if data[:4] != _sel(self.SIGS[0]):
-            return "unknown function"
+        if self.old:
+            (key, proof), qty, _aff, _sig = dec(["(bytes32,bytes32[])", "uint256", "address", "bytes"], data[4:])
+            return key, proof, qty, 2**255
         (key, proof), qty, _aff, _sig, (_cur, _mc, max_native, _mt) = dec(
             ["(bytes32,bytes32[])", "uint256", "address", "bytes", "(address,uint128,uint256,uint256)"], data[4:])
+        return key, proof, qty, max_native
+
+    def check(self, sender: str, value: int, data: bytes) -> str | None:
+        if data[:4] != _sel(self.sigs()[0]):
+            return "unknown function"
+        key, proof, qty, max_native = self._args(data)
         inv = self.invites.get(key)
         if not inv:
             return "MintNotYetStarted"
@@ -596,9 +624,7 @@ class FakeScatter:
         return None
 
     def mint(self, sender: str, data: bytes, tx_hash: str) -> list[dict]:
-        from eth_abi import decode as dec
-        (key, _p), qty = dec(["(bytes32,bytes32[])", "uint256", "address", "bytes",
-                              "(address,uint128,uint256,uint256)"], data[4:])[:2]
+        key, _p, qty, _m = self._args(data)
         self.minted_by[(sender.lower(), key)] = self.minted_by.get((sender.lower(), key), 0) + qty
         logs = []
         for _ in range(qty):
