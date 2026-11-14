@@ -104,12 +104,6 @@ PAGE_RENDER.mint = async () => {
   if (!head) return;
   const h1 = $("h1", head); if (h1) h1.textContent = "Mint";
   head.insertAdjacentHTML("afterend", `
-    <section class="panel"><div class="source-box">
-      <label>Paste a mint link or contract — OpenSea, LaunchMyNFT, Kalos, Scatter, a project site, or a 0x… address<input id="mn-src" placeholder="https://…  or  0x…" value=""></label>
-      <label style="flex:0 0 auto">Network${chainSelect("mn-chain", S.chainId)}</label>
-      <button class="primary" data-action="mn-go">Continue</button></div>
-      <div class="tiny muted" style="margin-top:8px">OpenSea drops use OpenSea's own mint flow. Anything else is read straight from the contract on-chain, whichever marketplace hosts it.</div>
-      <div id="mn-msg">${S651.linkMsg ? `<div class="notice warn">${esc(S651.linkMsg)}</div>` : ""}</div></section>
     <div class="tabs"><button class="${S651.mintTab === "opensea" ? "on" : ""}" data-action="mn-tab" data-tab="opensea">OpenSea drops</button>
       <button class="${S651.mintTab === "contract" ? "on" : ""}" data-action="mn-tab" data-tab="contract">Any contract <span class="n">LaunchMyNFT · Kalos · Scatter · others</span></button></div>`);
   S651.linkMsg = "";
