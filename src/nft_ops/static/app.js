@@ -1075,7 +1075,7 @@ async function renderContracts() {
   $("#main").innerHTML = `
     <div class="page-head"><h1>Contracts</h1></div>
     <div class="panel">
-      <p class="muted">For mints that are not OpenSea drops. Paste the NFT contract: the analyser reads it and lists how to mint, the price, supply and restrictions. Nothing is sent until you preview and confirm. Scatter drops are detected automatically.</p>
+      <p class="muted">For mints that are not OpenSea drops. Paste the NFT contract: the analyser reads it and lists how to mint, the price, supply and restrictions. Nothing is sent until you preview and confirm. Scatter drops have their own tab.</p>
       <div class="row">
         <label>Network ${chainSelect("c-chain", S.chainId)}</label>
         <label style="flex:1 1 360px">Contract address<input id="c-address" class="mono" value="${esc(c.address)}" placeholder="0x…"></label>

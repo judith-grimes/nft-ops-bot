@@ -6,7 +6,7 @@ contract address.
 ## Research notes
 
 Goal: mint drops hosted outside OpenSea as smoothly as OpenSea drops, starting with
-**Scatter** and **Kalos**. Today these work through *Mint → Any contract*, which reads the
+**Scatter** and **Kalos**. Scatter now has its own tab (*Mint → Scatter drops*); other sites use *Mint → Any contract*, which reads the
 contract on-chain. The notes below are what a dedicated adapter needs.
 
 ## Scatter (scatter.art) — confirmed from source code
