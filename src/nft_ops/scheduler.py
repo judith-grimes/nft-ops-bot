@@ -23,6 +23,7 @@ Safety rules:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -76,12 +77,48 @@ class ScheduleError(Exception):
     pass
 
 
-def tz_ok(name: str) -> str:
+# Short names people type, mapped to the real IANA name (keys are lower-case).
+TZ_ALIASES = {
+    "jakarta": "Asia/Jakarta", "jkt": "Asia/Jakarta", "wib": "Asia/Jakarta",
+    "asia/jkt": "Asia/Jakarta",
+    "singapore": "Asia/Singapore", "sgt": "Asia/Singapore",
+    "tokyo": "Asia/Tokyo", "jst": "Asia/Tokyo",
+    "london": "Europe/London", "new york": "America/New_York", "nyc": "America/New_York",
+    "utc": "UTC", "gmt": "UTC", "z": "UTC",
+}
+# Zones without daylight saving, usable even when the system has no timezone database
+# (Windows without the tzdata package). Zones with DST are deliberately not faked here.
+FIXED_ZONES = {"Asia/Jakarta": 7, "Asia/Singapore": 8, "Asia/Tokyo": 9, "UTC": 0}
+
+
+def _canonical(name: str) -> str:
+    name = (name or "").strip()
+    alias = TZ_ALIASES.get(name.lower())
+    if alias:
+        return alias
+    fixed = next((real for real in FIXED_ZONES if real.lower() == name.lower()), None)
+    return fixed or name
+
+
+def get_zone(name: str) -> dt.tzinfo:
+    """tzinfo for a timezone name; tolerant of case, short names and a missing tz database."""
+    canon = _canonical(name)
     try:
-        ZoneInfo(name)
+        return ZoneInfo(canon)
     except (ZoneInfoNotFoundError, ValueError):
-        raise ScheduleError(f"unknown timezone {name!r}") from None
-    return name
+        pass
+    if canon in FIXED_ZONES:
+        return dt.timezone(dt.timedelta(hours=FIXED_ZONES[canon]), canon)
+    raise ScheduleError(
+        f"unknown timezone {name!r}. Use a name like Asia/Jakarta, Asia/Singapore or UTC. "
+        "If Asia/Jakarta itself fails, the tzdata package is missing: run "
+        "'uv sync --frozen --python 3.12'.")
+
+
+def tz_ok(name: str) -> str:
+    """Validate a timezone and return its canonical name (e.g. 'asia/jkt' -> 'Asia/Jakarta')."""
+    zone = get_zone(name)
+    return getattr(zone, "key", None) or _canonical(name)
 
 
 class Scheduler:
@@ -553,8 +590,11 @@ class Scheduler:
     def _when(ts: float | None, tz: str) -> str:
         if not ts:
             return "unknown"
-        import datetime as dt
-        return dt.datetime.fromtimestamp(ts, ZoneInfo(tz)).strftime("%d %b %Y %H:%M ") + tz
+        try:
+            zone, label = get_zone(tz), tz
+        except ScheduleError:  # a bad saved timezone must never break a page
+            zone, label = dt.UTC, "UTC"
+        return dt.datetime.fromtimestamp(ts, zone).strftime("%d %b %Y %H:%M ") + label
 
     def _public(self, row: dict) -> dict:
         out = dict(row)

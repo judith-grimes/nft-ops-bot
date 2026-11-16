@@ -235,9 +235,26 @@ function scheduleRefresh() {
 // ---------------------------------------------------------------- navigation
 function go(page) { S.page = page; history.replaceState(null, "", `#${page}`); render(); }
 $("#nav").addEventListener("click", (e) => { const a = e.target.closest("a[data-page]"); if (a) go(a.dataset.page); });
+let renderSeq = 0;
 async function render() {
-  $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === S.page));
-  await guard(() => PAGE_RENDER[S.page]());
+  const page = S.page, seq = ++renderSeq;
+  $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === page));
+  try { await PAGE_RENDER[page](); } catch (e) {
+    if (e instanceof ApiError && e.message === "locked") return;
+    toast(e.message, true);
+    // Never leave the previous page on screen under this page's title.
+    if (seq === renderSeq && S.page === page) {
+      $("#main").innerHTML = `<div class="page-head"><div><h1>${esc(page)}</h1></div></div>
+        <section class="panel"><div class="notice bad"><b>This page could not load.</b> ${esc(e.message)}</div>
+        <button data-action="goto" data-page="${esc(page)}">Try again</button></section>`;
+    }
+  }
+}
+// Saved timezone from this browser, or Asia/Jakarta when it is missing or not a real zone.
+function safeTz() {
+  const tz = localStorageGet("nftops.tz");
+  try { if (tz) { new Intl.DateTimeFormat(undefined, { timeZone: tz }); return tz; } } catch { /* invalid */ }
+  return "Asia/Jakarta";
 }
 
 // ---------------------------------------------------------------- overview

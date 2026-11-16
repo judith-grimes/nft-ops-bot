@@ -75,7 +75,7 @@ async function scheduleModal(prefill = {}) {
   const [cols, w] = await Promise.all([api("/api/collections"), api(`/api/wallets?chain_id=${S.chainId}`)]);
   const live = liveCollections(cols.collections);
   if (!live.length) return toast("Add a collection first (Collections page).", true);
-  const f = { slug: live[0].slug, stage: "", source: "all", group: w.groups[0]?.name || "", quantity: 1, max_total: "", mode: "confirm", lead: 120, tz: localStorageGet("nftops.tz") || "Asia/Jakarta", name: "", ...prefill };
+  const f = { slug: live[0].slug, stage: "", source: "all", group: w.groups[0]?.name || "", quantity: 1, max_total: "", mode: "confirm", lead: 120, tz: safeTz(), name: "", ...prefill };
   const draw = () => {
     const col = live.find((c) => c.slug === f.slug) || live[0];
     const stages = col.stages.filter((s) => s.state !== "ended");
