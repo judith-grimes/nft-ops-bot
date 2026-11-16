@@ -229,7 +229,18 @@ class MintEngine:
         notes: list[str] = []
 
         async with self.gateway_factory(10.0, 16) as gateway:
-            chain = await gateway.prepare_chain(rpc_url)
+            # Fall back to this chain's other RPC links if the chosen one stops answering
+            # (health data can be minutes old; an ISP block or outage starts at any time).
+            if hasattr(gateway, "set_backups"):
+                gateway.set_backups([e.url for e in self.pool.endpoints(chain_id) if e.url != rpc_url])
+            try:
+                chain = await gateway.prepare_chain(rpc_url)
+            except ChainError as error:
+                raise MintEngineError(
+                    f"could not reach any RPC link for chain {chain_id} ({error}). Check the "
+                    "Networks page: test each link, and add another provider (e.g. dRPC) if "
+                    "they all fail. Your internet provider, VPN or antivirus may be blocking "
+                    "the connection.") from error
             if chain.chain_id != chain_id:
                 raise MintEngineError(f"RPC is on chain {chain.chain_id}, collection is on {chain_id}")
             snapshot = await gateway.wallet_snapshot(chain, params.addresses[0],

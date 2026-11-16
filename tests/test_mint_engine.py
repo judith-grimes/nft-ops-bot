@@ -193,3 +193,25 @@ def test_scheduled_allowlist_waits_for_launch(env):
         # osnm-z requests OpenSea's allowlist mint data 2 s before launch, then sends at once.
         assert all(t >= launch - 2.5 for t in sent_at)
     asyncio.run(run())
+
+
+def test_preview_falls_back_when_best_rpc_goes_down(env):
+    """The fastest RPC was healthy at the last check but is now blocked: use the backup."""
+    async def run():
+        wallets, metadata, allow = _setup(env)
+        now = time.time()
+        env.db.execute("UPDATE rpc_endpoints SET healthy = 1, latency_ms = 50, checked_at = ?",
+                       (now,))
+        env.db.execute("INSERT INTO rpc_endpoints(chain_id, url, priority, healthy, latency_ms, "
+                       "checked_at) VALUES(?, ?, 0, 1, 5, ?)",
+                       (metadata.network_id, "http://127.0.0.1:9999", now))
+        env.chain.down_ports.add(9999)
+        engine = _engine(env, metadata, allow)
+        await _scan(env, engine, metadata, wallets)
+        preview = await engine.preview(MintParams("fake-drop", 1, wallets))
+        assert preview["rows"] and env.chain.calls_by_port.get(9999)  # tried, then fell back
+
+        env.chain.down_ports.add(8545)  # every link down: a clear error, not a crash
+        with pytest.raises(MintEngineError, match="could not reach any RPC link"):
+            await engine.preview(MintParams("fake-drop", 1, wallets))
+    asyncio.run(run())

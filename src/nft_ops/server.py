@@ -29,6 +29,7 @@ from fastapi.responses import (
 )
 
 from osnm_z.opensea_protocol import ProtocolError
+from osnm_z.rpc_protocol import ChainError
 
 from . import (
     __version__,
@@ -71,7 +72,7 @@ STATIC = Path(__file__).parent / "static"
 USER_ERRORS = (WalletError, VaultError, CollectionError, MintEngineError, TxEngineError, NftError,
                ContractError, ReplaceError, backup.BackupError, OfferError, OpenSeaError,
                SeaportError, ScheduleError, groups.GroupError,
-               RpcError, ValueError,
+               RpcError, ChainError, ValueError,
                ProtocolError, KeyError)
 OPEN_PATHS = {"/api/state", "/api/vault/create", "/api/vault/unlock"}
 
